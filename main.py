@@ -69,6 +69,9 @@ def _load_dingtalk_notify_config() -> dict[str, str] | None:
     robot_code = _get_optional_env("DINGTALK_ROBOT_CODE")
     group_conversation_id = _get_optional_env("DINGTALK_GROUP_CONVERSATION_ID")
     user_name = _get_optional_env("DINGTALK_NOTIFY_USER_NAME")
+    if not user_name:
+        # 兼容历史变量名
+        user_name = _get_optional_env("DINGTALK_NOTIFY_USER")
     user_id = _get_optional_env("DINGTALK_NOTIFY_USER_ID")
 
     has_any = any([app_key, app_secret, robot_code, group_conversation_id, user_name, user_id])
