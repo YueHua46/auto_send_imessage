@@ -18,6 +18,10 @@ class AppConfig:
     imessage_dry_run: bool = False
     imessage_max_send_count: int | None = None
     imessage_state_path: str = ".领星待审核待发货iMessage发送历史.json"
+    imessage_batch_root_dir: str = "imessage_batches"
+    imessage_delivery_check_timeout_seconds: int = 45
+    imessage_delivery_check_interval_seconds: int = 3
+    imessage_delivery_check_lookback_seconds: int = 600
     imessage_risk_control: IMessageRiskControl = field(default_factory=IMessageRiskControl)
 
 

@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
 from config import APP_CONFIG
+from dingtalk_api import (
+    init_bot as init_dingtalk_bot,
+    send_markdown_to_group as dingtalk_send_markdown_to_group,
+    send_markdown_to_user as dingtalk_send_markdown_to_user,
+)
 from imessage_sender import send_imessages_with_risk_control
 from lingxing_result import (
     create_lingxing_session_from_login,
@@ -56,6 +63,39 @@ def _load_imessage_test_usernames() -> list[str]:
     return [name for name in usernames if name]
 
 
+def _load_dingtalk_notify_config() -> dict[str, str] | None:
+    app_key = _get_optional_env("DINGTALK_APP_KEY")
+    app_secret = _get_optional_env("DINGTALK_APP_SECRET")
+    robot_code = _get_optional_env("DINGTALK_ROBOT_CODE")
+    group_conversation_id = _get_optional_env("DINGTALK_GROUP_CONVERSATION_ID")
+    user_name = _get_optional_env("DINGTALK_NOTIFY_USER_NAME")
+    user_id = _get_optional_env("DINGTALK_NOTIFY_USER_ID")
+
+    has_any = any([app_key, app_secret, robot_code, group_conversation_id, user_name, user_id])
+    if not has_any:
+        return None
+
+    if not app_key or not app_secret or not robot_code:
+        raise ValueError(
+            "启用钉钉通知时，需要同时配置 DINGTALK_APP_KEY / DINGTALK_APP_SECRET / DINGTALK_ROBOT_CODE"
+        )
+
+    if not group_conversation_id and not user_name and not user_id:
+        raise ValueError(
+            "启用钉钉通知时，至少配置一个通知目标："
+            "DINGTALK_GROUP_CONVERSATION_ID 或 DINGTALK_NOTIFY_USER_NAME / DINGTALK_NOTIFY_USER_ID"
+        )
+
+    return {
+        "app_key": app_key,
+        "app_secret": app_secret,
+        "robot_code": robot_code,
+        "group_conversation_id": group_conversation_id or "",
+        "notify_user_name": user_name or "",
+        "notify_user_id": user_id or "",
+    }
+
+
 def write_json(path: str | Path, payload: object) -> None:
     Path(path).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -68,6 +108,7 @@ def load_runtime_config() -> dict[str, object]:
     return {
         "web_login": _load_lingxing_web_login_config(),
         "imessage_test_usernames": _load_imessage_test_usernames(),
+        "dingtalk_notify": _load_dingtalk_notify_config(),
         "app_config": APP_CONFIG,
     }
 
@@ -87,6 +128,150 @@ def _build_order_export_range(lookback_days: int) -> tuple[str, str]:
     )
 
 
+def _build_batch_data_paths(app_config: object) -> tuple[Path, Path, Path, Path]:
+    batch_date = datetime.now().strftime("%Y-%m-%d")
+    batch_dir = Path(str(getattr(app_config, "imessage_batch_root_dir"))) / batch_date
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    order_export_name = Path(str(getattr(app_config, "order_export_out"))).name
+    orders_json_name = Path(str(getattr(app_config, "orders_out"))).name
+    phones_json_name = Path(str(getattr(app_config, "phones_out"))).name
+
+    return (
+        batch_dir,
+        batch_dir / order_export_name,
+        batch_dir / orders_json_name,
+        batch_dir / phones_json_name,
+    )
+
+
+def _build_failure_reason_lines(send_results: list[Any], top_n: int = 5) -> list[str]:
+    reasons: Counter[str] = Counter()
+    for result in send_results:
+        status = str(getattr(result, "status", ""))
+        if status != "failed":
+            continue
+        error = str(getattr(result, "error", "") or "").strip()
+        detail = str(getattr(result, "detail", "") or "").strip()
+        reason = error or detail or "未知错误"
+        reason = reason[:140]
+        reasons[reason] += 1
+    if not reasons:
+        return []
+    lines: list[str] = []
+    for reason, count in reasons.most_common(top_n):
+        lines.append(f"- `{count}` 次：{reason}")
+    return lines
+
+
+def _build_dingtalk_markdown_report(
+    *,
+    batch_date: str,
+    batch_dir: Path,
+    recipients_count: int,
+    send_results: list[Any],
+    dry_run: bool,
+    imessage_enabled: bool,
+) -> tuple[str, str]:
+    status_counter = Counter(str(getattr(item, "status", "unknown")) for item in send_results)
+    delivered_count = status_counter.get("delivered", 0)
+    sent_not_confirmed_count = status_counter.get("sent_not_confirmed", 0)
+    failed_count = status_counter.get("failed", 0)
+    skipped_processed_count = status_counter.get("skipped_processed", 0)
+    skipped_count = status_counter.get("skipped", 0)
+    dry_run_count = status_counter.get("dry_run", 0)
+
+    success_count = delivered_count + sent_not_confirmed_count
+    processed_non_failed = success_count + skipped_processed_count + dry_run_count
+    failure_rate = (failed_count / max(len(send_results), 1)) * 100
+
+    title = f"iMessage批次结果通知 | {batch_date}"
+    mode_text = "Dry Run（仅模拟）" if dry_run else ("正式发送" if imessage_enabled else "未执行发送")
+    markdown_lines = [
+        f"### iMessage批次执行汇总（{batch_date}）",
+        "",
+        f"> 执行模式：**{mode_text}**",
+        f"> 批次目录：`{batch_dir}`",
+        "",
+        "#### 总览",
+        f"- 收件目标总数：**{recipients_count}**",
+        f"- 结果记录总数：**{len(send_results)}**",
+        f"- 成功（已发送且非失败）：**{success_count}**",
+        f"- 失败：**{failed_count}**（失败率 {failure_rate:.1f}%）",
+        f"- 跳过（本批次已处理）：**{skipped_processed_count}**",
+        f"- 跳过（额度/规则）：**{skipped_count}**",
+        f"- Dry Run：**{dry_run_count}**",
+        "",
+        "#### 状态明细",
+        f"- `delivered`：**{delivered_count}**",
+        f"- `sent_not_confirmed`：**{sent_not_confirmed_count}**",
+        f"- `failed`：**{failed_count}**",
+        "",
+    ]
+    if processed_non_failed > 0:
+        markdown_lines.extend(
+            [
+                "#### 执行判断",
+                "- 本次策略：仅 `failed` 会参与后续重跑，"
+                "`delivered` / `sent_not_confirmed` / `skipped_processed` 都视为已处理。",
+                "",
+            ]
+        )
+
+    failure_reason_lines = _build_failure_reason_lines(send_results)
+    if failure_reason_lines:
+        markdown_lines.append("#### 失败原因（Top）")
+        markdown_lines.extend(failure_reason_lines)
+    else:
+        markdown_lines.append("#### 失败原因（Top）")
+        markdown_lines.append("- 本次无失败记录")
+
+    return title, "\n".join(markdown_lines)
+
+
+def _send_dingtalk_summary_if_configured(
+    *,
+    dingtalk_config: dict[str, str] | None,
+    title: str,
+    markdown_text: str,
+) -> None:
+    if not dingtalk_config:
+        print("未配置钉钉通知，跳过发送批次汇总。")
+        return
+
+    init_dingtalk_bot(
+        app_key=dingtalk_config["app_key"],
+        app_secret=dingtalk_config["app_secret"],
+        robot_code=dingtalk_config["robot_code"],
+    )
+
+    group_conversation_id = dingtalk_config.get("group_conversation_id", "").strip()
+    notify_user_id = dingtalk_config.get("notify_user_id", "").strip()
+    notify_user_name = dingtalk_config.get("notify_user_name", "").strip()
+
+    if group_conversation_id:
+        dingtalk_send_markdown_to_group(
+            conversation_id=group_conversation_id,
+            title=title,
+            text=markdown_text,
+        )
+        print("钉钉批次汇总已发送到群聊。")
+        return
+
+    target = notify_user_id or notify_user_name
+    if not target:
+        print("钉钉通知未配置接收人/群，跳过发送。")
+        return
+
+    dingtalk_send_markdown_to_user(
+        user_id_or_name=target,
+        title=title,
+        text=markdown_text,
+        by_name=not bool(notify_user_id),
+    )
+    print("钉钉批次汇总已发送到单聊。")
+
+
 def main() -> int:
     try:
         config = load_runtime_config()
@@ -102,8 +287,20 @@ def main() -> int:
         )
         return 2
 
+    batch_dir: Path | None = None
+    recipients_count = 0
+    send_results: list[Any] = []
+    app_config: Any = APP_CONFIG
+    dingtalk_config: dict[str, str] | None = None
+
     try:
+        dingtalk_config = config.get("dingtalk_notify") if isinstance(config, dict) else None
         app_config = config["app_config"]  # type: ignore[assignment]
+        batch_dir, order_export_path_in_batch, orders_json_path_in_batch, phones_json_path_in_batch = (
+            _build_batch_data_paths(app_config)
+        )
+        print(f"当前批次目录: {batch_dir.resolve()}")
+
         web_session = create_lingxing_session_from_login(
             account=str(web_login["account"]),
             password=str(web_login["password"]),
@@ -125,20 +322,20 @@ def main() -> int:
             session=web_session,
             start_time=start_time,
             end_time=end_time,
-            save_path=app_config.order_export_out,
+            save_path=str(order_export_path_in_batch),
             debug=app_config.print_request_debug,
         )
         print(f"订单管理导出成功: {Path(export_path).resolve()}")
 
         orders = parse_order_management_export_file(export_path)
         phones = extract_phone_numbers_from_order_records(orders)
-        write_json(app_config.orders_out, orders)
-        write_json(app_config.phones_out, phones)
+        write_json(orders_json_path_in_batch, orders)
+        write_json(phones_json_path_in_batch, phones)
 
         print(f"订单解析完成: {len(orders)} 条")
         print(f"提取到不重复手机号: {len(phones)}")
-        print(f"订单JSON已保存至: {Path(app_config.orders_out).resolve()}")
-        print(f"手机号JSON已保存至: {Path(app_config.phones_out).resolve()}")
+        print(f"订单JSON已保存至: {orders_json_path_in_batch.resolve()}")
+        print(f"手机号JSON已保存至: {phones_json_path_in_batch.resolve()}")
 
         if not app_config.imessage_send_enabled and not app_config.imessage_dry_run:
             return 0
@@ -150,6 +347,7 @@ def main() -> int:
             else []
         )
         recipients = test_usernames if test_usernames else phones
+        recipients_count = len(recipients)
         if test_usernames:
             print(
                 "检测到 IMESSAGE_TEST_USERNAMES，进入测试用户名发送模式，"
@@ -164,12 +362,54 @@ def main() -> int:
             rules=app_config.imessage_risk_control,
             state_path=app_config.imessage_state_path,
             normalize_phone_numbers=not bool(test_usernames),
+            batch_root_dir=app_config.imessage_batch_root_dir,
+            delivery_check_timeout_seconds=app_config.imessage_delivery_check_timeout_seconds,
+            delivery_check_interval_seconds=app_config.imessage_delivery_check_interval_seconds,
+            delivery_check_lookback_seconds=app_config.imessage_delivery_check_lookback_seconds,
         )
         for result in send_results:
-            print(f"[{result.status}] {result.phone} - {result.detail}")
+            if result.error:
+                print(f"[{result.status}] {result.phone} - {result.detail} (error={result.error})")
+            else:
+                print(f"[{result.status}] {result.phone} - {result.detail}")
+
+        if batch_dir is not None:
+            batch_date = batch_dir.name
+            title, markdown_text = _build_dingtalk_markdown_report(
+                batch_date=batch_date,
+                batch_dir=batch_dir,
+                recipients_count=recipients_count,
+                send_results=send_results,
+                dry_run=app_config.imessage_dry_run,
+                imessage_enabled=app_config.imessage_send_enabled,
+            )
+            try:
+                _send_dingtalk_summary_if_configured(
+                    dingtalk_config=dingtalk_config,
+                    title=title,
+                    markdown_text=markdown_text,
+                )
+            except Exception as notify_exc:  # noqa: BLE001
+                print(f"钉钉批次汇总发送失败: {notify_exc}")
         return 0
     except Exception as exc:  # noqa: BLE001
         print(f"领星流程执行失败: {exc}")
+        if batch_dir is not None:
+            try:
+                fail_title = f"iMessage批次执行失败 | {batch_dir.name}"
+                fail_markdown = (
+                    f"### iMessage批次执行失败（{batch_dir.name}）\n\n"
+                    f"- 批次目录：`{batch_dir}`\n"
+                    f"- 错误信息：`{exc}`\n"
+                    "- 请检查领星登录、导出链路与iMessage发送环境。"
+                )
+                _send_dingtalk_summary_if_configured(
+                    dingtalk_config=dingtalk_config,
+                    title=fail_title,
+                    markdown_text=fail_markdown,
+                )
+            except Exception as notify_exc:  # noqa: BLE001
+                print(f"钉钉失败通知发送失败: {notify_exc}")
         return 1
 
 if __name__ == "__main__":
