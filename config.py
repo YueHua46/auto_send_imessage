@@ -1,0 +1,24 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from imessage_sender import IMessageRiskControl
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    lookback_days: int = 31
+    order_statuses: tuple[int, ...] = (4, 5)
+    orders_out: str = "领星待审核待发货订单.json"
+    phones_out: str = "领星待审核待发货手机号.json"
+    order_export_out: str = "订单管理导出.xlsx"
+    print_request_debug: bool = True
+    imessage_text: str = "Hi"
+    imessage_send_enabled: bool = False
+    imessage_dry_run: bool = False
+    imessage_max_send_count: int | None = None
+    imessage_state_path: str = ".领星待审核待发货iMessage发送历史.json"
+    imessage_risk_control: IMessageRiskControl = field(default_factory=IMessageRiskControl)
+
+
+APP_CONFIG = AppConfig()

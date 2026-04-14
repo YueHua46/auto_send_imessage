@@ -1,0 +1,305 @@
+===== PAGE 1 =====
+领星  API 接入指南
+1. 准备工作
+1.1. 申请 AppId 和 AppSecret
+接入领星  API 公共服务前须先申请 AppId 和 AppSecret ， AppId 和 AppSecret 是生成调用领
+星功能接口凭证 token 的必须参数，客户需要妥善保管，操作流程见  如何申请企业的 appid
+和 appsecret ？ ；
+1.2. 配置 IP 白名单
+除申请 AppId 和 AppSecret 外，还需添加允许访问的外网 IP 白名单，二者缺一不可，操作流
+程见  如何配置 ip 白名单？ ；
+2. 业务接口的调用
+2.1 API 请求域名
+https://openapi.lingxing.com
+2.2 公共请求参数
+参数名 类型 描述 数据来源
+access_tokenstring通过接口获取的 token 信息access_token 获取
+app_key stringAPP ID API 信息的查询与配置
+timestampstring时间戳 1720408272
+sign string接口签名 签名 sign 的生成
+举例说明公共请求参数在接口请求中的使用 (Query Params 传参) ：
+如果没有传递完整的公共请求参数，则会出现公共请求参数不完整的问题
+注意：sign 作为参数，在传输时需要进行 URL 编码【 url encode 】以确保能够正常传递
+并被正确处理
+2.3 接口请求
+2.3.1 Get 类型请求
+业务请求参数 + 公共请求参数，都拼接在 url 上面
+比如发送业务参数为offset=0,length=100的 GET 请求，则 url 参数拼装为：
+access_token=44fa2eed-xxxx-xxxx-xxxx-
+8c6abe5ea6a4&app_key=ak_xxxxxxxxxS&timestamp=1720429074&sign=NaUK5YE68tgyVz%2FheN8WqPvL%2
+举例说明 Get 请求如下：
+  搜索
+接⼝更新⽇志
+Token ⽣成测试
+接⼝签名⽣成测试
+在线请求测试
+接⼊指引
+API 信息的查询与配置
+领星  API 接⼊指南
+-1. 准备⼯作
+-2. 业务接⼝的调⽤
+-3. access_token 获取及续约
+-4. 签名 sign 的⽣成
+-5. 限流算法说明
+-6. SDK 下载
+常⻅问题案例
+全局错误码说明
+常⻅场景
+授权
+基础数据
+销售
+FBA
+补货建议
+补货限制
+产品
+采购
+仓库
+物流
+新⼴告
+财务
+客服
+⼯具
+统计
+⽬标管理
+多平台
+VC
+亚⻢逊源表数据
+  API ⽂档 API 地图 中⽂
+2026/4/13 16:49 领星  API 接⼊指南  - Document
+https://apidoc.lingxing.com/#/docs/Guidance/newInstructions 1/5
+
+===== PAGE 2 =====
+2.3.2 POST 类型请求
+业务请求参数（放入 body ， json 形式传参） + 公共请求参数
+注意：
+1. body 参数中若嵌套有集合需要转成 string 参与签名, 否则会出现生成签名不正确的问
+题
+2. 接口文档无特殊说明的， body 内参数均以 json 格式传输， header 中需要设置
+Content-type:application/json
+比如发送业务参数为{"name": "kobe", "content": { "city": "lake", "age": 
+"133" }}请求，
+举例说明使用  postman 发送 POST 请求，示例如下：
+3. access_token 获取及续约
+3.1 access_token 获取
+access_token 是领星 API 调用的凭证，调用各业务接口时都需使用 access_token ，开发者需
+要进行妥善保存；详见接口文档  获取接口令牌 -access_token。
+3.2 access_token 续约
+如果不想生成新的 token ，可以根据 appId 和 access_token 续约 access_token ；在
+access_token 到期前调用续约接口，每次调用都会生成新的 refresh_token ，详见接口文档
+续约接口令牌
+ 
+curl --location --max-time 30000 'https://openapi.lingxing.com/xxx/xxx
+ssh
+接⼝更新⽇志
+Token ⽣成测试
+接⼝签名⽣成测试
+在线请求测试
+接⼊指引
+API 信息的查询与配置
+领星  API 接⼊指南
+-1. 准备⼯作
+-2. 业务接⼝的调⽤
+-3. access_token 获取及续约
+-4. 签名 sign 的⽣成
+-5. 限流算法说明
+-6. SDK 下载
+常⻅问题案例
+全局错误码说明
+常⻅场景
+授权
+基础数据
+销售
+FBA
+补货建议
+补货限制
+产品
+采购
+仓库
+物流
+新⼴告
+财务
+客服
+⼯具
+统计
+⽬标管理
+多平台
+VC
+亚⻢逊源表数据
+2026/4/13 16:49 领星  API 接⼊指南  - Document
+https://apidoc.lingxing.com/#/docs/Guidance/newInstructions 2/5
+
+===== PAGE 3 =====
+注意：refresh_token 的有效期为  2 个小时，一个 refresh_token 只能被使用一次给
+access_token 续约，如果需要再次续约，需要使用上次续约返回的 refresh_token
+使用  postman 续约 access_token 示例如下：
+4. 签名 sign 的生成
+4.1 sign 的生成规则：
+a ）请求包含的所有参数使用  ASII 排序【所有的业务请求入参 +3 个固定参数
+（ access_token 、 app_key 、 timestamp ）】；
+b ）以  key1=value1&key2=value2&...&keyn=valuen 的格式拼接起来，其中 key 为参数
+键， value 为参数值【 value 为空不参与生成签名！（ value 为 null 会参与生成签
+名）】；
+c ）拼接之后的字符串用 MD5(32 位 ) 加密后转大写；
+d ）用 AES/ECB/PKCS5PADDING 对生成的 MD5 值加密，其中 AES 加密的密钥为 appId ；
+AES 加密采用 ECB 模式，填充方式为 PKCS5PADDING
+注意：
+1.sign 作为参数，在传输时需要进行 URL 编码【 url encode 】，以确保能够正常接收处
+理。
+2. 当 timestamp 以固定值参与签名生成 sign 时， sign 的有效期为  2 分钟， 2 分钟后签名
+过期，因此建议调用业务接口时使用实时的时间戳生成签名 sign ，不要缓存 sign
+3. 当有文件上传需要生成签名时，需要文件原始名作为 key ，文件 md5 加密的值为
+value ， key 不要使用汉字， key=originFileName ，
+value=DigestUtils.md5Hex(InputStream()))
+4.2 最佳实践：
+1. 下载相应语言的SDK文件，以 Java 语言为例
+2. 根据自身业务进行修改，如下所示：
+
+ public static void main(String[] args) throws Exception {
+     String appId = "xxx";
+     Map  queryParam = new HashMap<>(); String,< Object>
+接⼝更新⽇志
+Token ⽣成测试
+接⼝签名⽣成测试
+在线请求测试
+接⼊指引
+API 信息的查询与配置
+领星  API 接⼊指南
+-1. 准备⼯作
+-2. 业务接⼝的调⽤
+-3. access_token 获取及续约
+-4. 签名 sign 的⽣成
+-5. 限流算法说明
+-6. SDK 下载
+常⻅问题案例
+全局错误码说明
+常⻅场景
+授权
+基础数据
+销售
+FBA
+补货建议
+补货限制
+产品
+采购
+仓库
+物流
+新⼴告
+财务
+客服
+⼯具
+统计
+⽬标管理
+多平台
+VC
+亚⻢逊源表数据
+2026/4/13 16:49 领星  API 接⼊指南  - Document
+https://apidoc.lingxing.com/#/docs/Guidance/newInstructions 3/5
+
+===== PAGE 4 =====
+5. 限流算法说明
+改进的令牌桶算法：为每一个请求提供一个令牌；当请求到达时，如果桶中有足够的
+令牌，则会消耗一个令牌并允许请求通过；  如果没有令牌，则请求被限流（错误码：
+3001008 ）；
+令牌回收是基于请求完成、异常、超时（ 2min ）；
+令牌桶的维度： appId + 接口 url 。
+限流算法示意图：
+6. SDK 下载
+Go
+PHP
+Java
+NODE
+Python
+[ 领星 API 接入指南（旧版文档入口，新客户无需关注）
+
+
+     queryParam.put("timestamp", 1639734344);
+     queryParam.put("access_token", "59cf5437-669b-49f5-83c4-3cc1
+     queryParam.put("app_key", appId);
+     String sign = ApiSign.sign(queryParam, appId);
+     queryParam.put("sign", sign);
+     log.info("sign:{}", sign);
+     HttpRequest  build = HttpRequest.builder(Object.clas
+             .method(HttpMethod.GET)
+ .endpoint("xxxx")
+Object< >
+接⼝更新⽇志
+Token ⽣成测试
+接⼝签名⽣成测试
+在线请求测试
+接⼊指引
+API 信息的查询与配置
+领星  API 接⼊指南
+-1. 准备⼯作
+-2. 业务接⼝的调⽤
+-3. access_token 获取及续约
+-4. 签名 sign 的⽣成
+-5. 限流算法说明
+-6. SDK 下载
+常⻅问题案例
+全局错误码说明
+常⻅场景
+授权
+基础数据
+销售
+FBA
+补货建议
+补货限制
+产品
+采购
+仓库
+物流
+新⼴告
+财务
+客服
+⼯具
+统计
+⽬标管理
+多平台
+VC
+亚⻢逊源表数据
+2026/4/13 16:49 领星  API 接⼊指南  - Document
+https://apidoc.lingxing.com/#/docs/Guidance/newInstructions 4/5
+
+===== PAGE 5 =====
+常见问题案例
+ 上一章节
+API 信息的查询与配置
+下一章节  
+接⼝更新⽇志
+Token ⽣成测试
+接⼝签名⽣成测试
+在线请求测试
+接⼊指引
+API 信息的查询与配置
+领星  API 接⼊指南
+-1. 准备⼯作
+-2. 业务接⼝的调⽤
+-3. access_token 获取及续约
+-4. 签名 sign 的⽣成
+-5. 限流算法说明
+-6. SDK 下载
+常⻅问题案例
+全局错误码说明
+常⻅场景
+授权
+基础数据
+销售
+FBA
+补货建议
+补货限制
+产品
+采购
+仓库
+物流
+新⼴告
+财务
+客服
+⼯具
+统计
+⽬标管理
+多平台
+VC
+亚⻢逊源表数据
+2026/4/13 16:49 领星  API 接⼊指南  - Document
+https://apidoc.lingxing.com/#/docs/Guidance/newInstructions 5/5
+

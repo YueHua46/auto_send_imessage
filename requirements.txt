@@ -1,0 +1,8 @@
+facebook-wda
+pandas
+Pillow
+python-dotenv
+orjson
+pycryptodome
+requests
+dotenv
