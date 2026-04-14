@@ -47,6 +47,15 @@ def _load_lingxing_web_login_config() -> dict[str, str] | None:
     }
 
 
+def _load_imessage_test_usernames() -> list[str]:
+    raw = os.getenv("IMESSAGE_TEST_USERNAMES", "").strip()
+    if not raw:
+        return []
+    normalized = raw.replace("，", ",").replace(";", ",").replace("\n", ",")
+    usernames = [item.strip() for item in normalized.split(",")]
+    return [name for name in usernames if name]
+
+
 def write_json(path: str | Path, payload: object) -> None:
     Path(path).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -58,6 +67,7 @@ def load_runtime_config() -> dict[str, object]:
     load_dotenv()
     return {
         "web_login": _load_lingxing_web_login_config(),
+        "imessage_test_usernames": _load_imessage_test_usernames(),
         "app_config": APP_CONFIG,
     }
 
@@ -133,13 +143,27 @@ def main() -> int:
         if not app_config.imessage_send_enabled and not app_config.imessage_dry_run:
             return 0
 
+        imessage_test_usernames = config.get("imessage_test_usernames")
+        test_usernames = (
+            imessage_test_usernames
+            if isinstance(imessage_test_usernames, list)
+            else []
+        )
+        recipients = test_usernames if test_usernames else phones
+        if test_usernames:
+            print(
+                "检测到 IMESSAGE_TEST_USERNAMES，进入测试用户名发送模式，"
+                f"将按指定列表发送（{len(test_usernames)}个目标）"
+            )
+
         send_results = send_imessages_with_risk_control(
-            phones,
+            recipients,
             message=app_config.imessage_text,
             dry_run=app_config.imessage_dry_run,
             max_send_count=app_config.imessage_max_send_count,
             rules=app_config.imessage_risk_control,
             state_path=app_config.imessage_state_path,
+            normalize_phone_numbers=not bool(test_usernames),
         )
         for result in send_results:
             print(f"[{result.status}] {result.phone} - {result.detail}")

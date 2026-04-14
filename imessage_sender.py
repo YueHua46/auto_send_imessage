@@ -127,12 +127,16 @@ def send_imessages_with_risk_control(
     rules: IMessageRiskControl | None = None,
     max_send_count: int | None = None,
     state_path: str | Path = ".imessage_send_history.json",
+    normalize_phone_numbers: bool = True,
 ) -> list[SendResult]:
     # 采用传入的风控规则，否则用默认
     rules = rules or IMessageRiskControl()
     # 首先对手机号去重及规范化
-    normalized_unique_phones = list(dict.fromkeys(_normalize_phone_number(phone) for phone in phones))
-    unique_phones = [phone for phone in normalized_unique_phones if phone]
+    if normalize_phone_numbers:
+        normalized_unique_phones = list(dict.fromkeys(_normalize_phone_number(phone) for phone in phones))
+        unique_phones = [phone for phone in normalized_unique_phones if phone]
+    else:
+        unique_phones = list(dict.fromkeys((phone or "").strip() for phone in phones if (phone or "").strip()))
     state_file = Path(state_path)
     history = _load_history(state_file)
     now = datetime.now()
