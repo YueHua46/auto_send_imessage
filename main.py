@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -99,6 +100,15 @@ def _load_dingtalk_notify_config() -> dict[str, str] | None:
     }
 
 
+def _load_runtime_app_config() -> Any:
+    imessage_text_override = _get_optional_env("IMESSAGE_TEXT")
+    if not imessage_text_override:
+        return APP_CONFIG
+    # 支持在 .env 中用 \n 表示换行
+    normalized_text = imessage_text_override.replace("\\n", "\n")
+    return replace(APP_CONFIG, imessage_text=normalized_text)
+
+
 def write_json(path: str | Path, payload: object) -> None:
     Path(path).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -112,7 +122,7 @@ def load_runtime_config() -> dict[str, object]:
         "web_login": _load_lingxing_web_login_config(),
         "imessage_test_usernames": _load_imessage_test_usernames(),
         "dingtalk_notify": _load_dingtalk_notify_config(),
-        "app_config": APP_CONFIG,
+        "app_config": _load_runtime_app_config(),
     }
 
 
