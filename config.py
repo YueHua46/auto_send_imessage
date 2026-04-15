@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from imessage_sender import IMessageRiskControl
+from imessage_sender import IMessageRiskControl, IMsgCLIConfig
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,7 @@ class AppConfig:
     imessage_max_send_count: int | None = None
     imessage_state_path: str = ".领星待审核待发货iMessage发送历史.json"
     imessage_batch_root_dir: str = "imessage_batches"
+    imessage_imsg_config: IMsgCLIConfig = field(default_factory=IMsgCLIConfig)
     imessage_delivery_check_timeout_seconds: int = 90
     imessage_delivery_check_interval_seconds: int = 3
     imessage_delivery_check_lookback_seconds: int = 600

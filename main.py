@@ -99,6 +99,39 @@ def _get_optional_int_env(name: str) -> int | None:
         raise ValueError(f"{name} 必须是整数，当前值: {raw}") from exc
 
 
+def _load_runtime_imsg_cli_config(app_config: Any) -> Any:
+    base_config = getattr(app_config, "imessage_imsg_config")
+    overrides: dict[str, Any] = {}
+
+    binary = _get_optional_env("IMESSAGE_IMSG_BINARY")
+    if binary:
+        overrides["binary"] = binary
+
+    service = _get_optional_env("IMESSAGE_IMSG_SERVICE")
+    if service:
+        normalized_service = service.strip().lower()
+        if normalized_service not in {"auto", "imessage", "sms"}:
+            raise ValueError(
+                "IMESSAGE_IMSG_SERVICE 仅支持 auto / imessage / sms，"
+                f"当前值: {service}"
+            )
+        overrides["service"] = normalized_service
+
+    region = _get_optional_env("IMESSAGE_IMSG_REGION")
+    if region:
+        overrides["region"] = region.strip().upper()
+
+    send_timeout = _get_optional_int_env("IMESSAGE_IMSG_SEND_TIMEOUT_SECONDS")
+    if send_timeout is not None:
+        if send_timeout <= 0:
+            raise ValueError("IMESSAGE_IMSG_SEND_TIMEOUT_SECONDS 必须大于 0")
+        overrides["send_timeout_seconds"] = send_timeout
+
+    if not overrides:
+        return base_config
+    return replace(base_config, **overrides)
+
+
 def _parse_csv_values(raw: str) -> list[str]:
     normalized = raw.replace("，", ",").replace(";", ",").replace("\n", ",")
     return [item.strip() for item in normalized.split(",") if item.strip()]
@@ -177,6 +210,10 @@ def _load_runtime_app_config() -> Any:
         if timeout_override <= 0:
             raise ValueError("IMESSAGE_DELIVERY_CHECK_TIMEOUT_SECONDS 必须大于 0")
         overrides["imessage_delivery_check_timeout_seconds"] = timeout_override
+
+    imsg_cli_config = _load_runtime_imsg_cli_config(APP_CONFIG)
+    if imsg_cli_config != APP_CONFIG.imessage_imsg_config:
+        overrides["imessage_imsg_config"] = imsg_cli_config
 
     if not overrides:
         return APP_CONFIG
@@ -307,14 +344,14 @@ def _build_dingtalk_markdown_report(
     imessage_enabled: bool,
 ) -> tuple[str, str]:
     status_counter = Counter(str(getattr(item, "status", "unknown")) for item in send_results)
-    delivered_count = status_counter.get("delivered", 0)
+    confirmed_in_imsg_count = status_counter.get("confirmed_in_imsg", 0) + status_counter.get("delivered", 0)
     sent_not_confirmed_count = status_counter.get("sent_not_confirmed", 0)
     failed_count = status_counter.get("failed", 0)
     skipped_processed_count = status_counter.get("skipped_processed", 0)
     skipped_count = status_counter.get("skipped", 0)
     dry_run_count = status_counter.get("dry_run", 0)
 
-    success_count = delivered_count + sent_not_confirmed_count
+    success_count = confirmed_in_imsg_count + sent_not_confirmed_count
     processed_non_failed = success_count + skipped_processed_count + dry_run_count
     failure_rate = (failed_count / max(len(send_results), 1)) * 100
 
@@ -336,7 +373,7 @@ def _build_dingtalk_markdown_report(
         f"- Dry Run：**{dry_run_count}**",
         "",
         "#### 状态明细",
-        f"- `delivered`：**{delivered_count}**",
+        f"- `confirmed_in_imsg`：**{confirmed_in_imsg_count}**",
         f"- `sent_not_confirmed`：**{sent_not_confirmed_count}**",
         f"- `failed`：**{failed_count}**",
         "",
@@ -346,7 +383,7 @@ def _build_dingtalk_markdown_report(
             [
                 "#### 执行判断",
                 "- 本次策略：仅 `failed` 会参与后续重跑，"
-                "`delivered` / `sent_not_confirmed` / `skipped_processed` 都视为已处理。",
+                "`confirmed_in_imsg` / `sent_not_confirmed` / `skipped_processed` 都视为已处理。",
                 "",
             ]
         )
@@ -534,6 +571,7 @@ def main() -> int:
             normalize_phone_numbers=normalize_phone_numbers,
             batch_root_dir=app_config.imessage_batch_root_dir,
             batch_date=execution_batch_date,
+            cli_config=app_config.imessage_imsg_config,
             delivery_check_timeout_seconds=app_config.imessage_delivery_check_timeout_seconds,
             delivery_check_interval_seconds=app_config.imessage_delivery_check_interval_seconds,
             delivery_check_lookback_seconds=app_config.imessage_delivery_check_lookback_seconds,
