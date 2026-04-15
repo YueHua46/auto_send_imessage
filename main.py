@@ -38,6 +38,16 @@ def _get_optional_env(name: str) -> str | None:
     return value or None
 
 
+def _get_optional_int_env(name: str) -> int | None:
+    raw = _get_optional_env(name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是整数，当前值: {raw}") from exc
+
+
 def _load_lingxing_web_login_config() -> dict[str, str] | None:
     account = _get_optional_env("LINGXING_WEB_ACCOUNT")
     password = _get_optional_env("LINGXING_WEB_PASSWORD")
@@ -101,12 +111,22 @@ def _load_dingtalk_notify_config() -> dict[str, str] | None:
 
 
 def _load_runtime_app_config() -> Any:
+    overrides: dict[str, Any] = {}
+
     imessage_text_override = _get_optional_env("IMESSAGE_TEXT")
-    if not imessage_text_override:
+    if imessage_text_override:
+        # 支持在 .env 中用 \n 表示换行
+        overrides["imessage_text"] = imessage_text_override.replace("\\n", "\n")
+
+    timeout_override = _get_optional_int_env("IMESSAGE_DELIVERY_CHECK_TIMEOUT_SECONDS")
+    if timeout_override is not None:
+        if timeout_override <= 0:
+            raise ValueError("IMESSAGE_DELIVERY_CHECK_TIMEOUT_SECONDS 必须大于 0")
+        overrides["imessage_delivery_check_timeout_seconds"] = timeout_override
+
+    if not overrides:
         return APP_CONFIG
-    # 支持在 .env 中用 \n 表示换行
-    normalized_text = imessage_text_override.replace("\\n", "\n")
-    return replace(APP_CONFIG, imessage_text=normalized_text)
+    return replace(APP_CONFIG, **overrides)
 
 
 def write_json(path: str | Path, payload: object) -> None:
