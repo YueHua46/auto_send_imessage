@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from collections import Counter
@@ -26,6 +27,56 @@ from lingxing_result import (
 )
 
 
+def _parse_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="自动发送 iMessage（支持指定历史批次重跑）",
+    )
+    parser.add_argument(
+        "rerun_batch_date",
+        nargs="?",
+        help="可选：指定重跑批次日期（YYYY-MM-DD），例如 2026-04-14",
+    )
+    parser.add_argument(
+        "--rerun-batch-date",
+        dest="rerun_batch_date_flag",
+        help="指定重跑批次日期（YYYY-MM-DD）",
+    )
+    parser.add_argument(
+        "--rerun-include-statuses",
+        default="",
+        help="重跑纳入状态，逗号分隔（例如 failed,sent_not_confirmed）",
+    )
+    return parser.parse_args()
+
+
+def _resolve_rerun_batch_date_from_sources(
+    *,
+    cli_args: argparse.Namespace,
+) -> str | None:
+    candidate = cli_args.rerun_batch_date_flag or cli_args.rerun_batch_date
+    if not candidate:
+        return None
+    candidate = candidate.strip()
+    try:
+        datetime.strptime(candidate, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"批次日期格式必须为 YYYY-MM-DD，当前值: {candidate}") from exc
+    return candidate
+
+
+def _resolve_rerun_include_statuses_from_sources(
+    *,
+    cli_args: argparse.Namespace,
+) -> tuple[str, ...]:
+    if cli_args.rerun_include_statuses.strip():
+        items = _parse_csv_values(cli_args.rerun_include_statuses)
+        lowered = tuple(dict.fromkeys(item.lower() for item in items))
+        if not lowered:
+            raise ValueError("--rerun-include-statuses 不能为空")
+        return lowered
+    return ("failed",)
+
+
 def _get_required_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -46,6 +97,11 @@ def _get_optional_int_env(name: str) -> int | None:
         return int(raw)
     except ValueError as exc:
         raise ValueError(f"{name} 必须是整数，当前值: {raw}") from exc
+
+
+def _parse_csv_values(raw: str) -> list[str]:
+    normalized = raw.replace("，", ",").replace(";", ",").replace("\n", ",")
+    return [item.strip() for item in normalized.split(",") if item.strip()]
 
 
 def _load_lingxing_web_login_config() -> dict[str, str] | None:
@@ -69,9 +125,7 @@ def _load_imessage_test_usernames() -> list[str]:
     raw = os.getenv("IMESSAGE_TEST_USERNAMES", "").strip()
     if not raw:
         return []
-    normalized = raw.replace("，", ",").replace(";", ",").replace("\n", ",")
-    usernames = [item.strip() for item in normalized.split(",")]
-    return [name for name in usernames if name]
+    return _parse_csv_values(raw)
 
 
 def _load_dingtalk_notify_config() -> dict[str, str] | None:
@@ -161,8 +215,9 @@ def _build_order_export_range(lookback_days: int) -> tuple[str, str]:
     )
 
 
-def _build_batch_data_paths(app_config: object) -> tuple[Path, Path, Path, Path]:
-    batch_date = datetime.now().strftime("%Y-%m-%d")
+def _build_batch_data_paths(app_config: object, *, batch_date: str | None = None) -> tuple[Path, Path, Path, Path]:
+    if not batch_date:
+        batch_date = datetime.now().strftime("%Y-%m-%d")
     batch_dir = Path(str(getattr(app_config, "imessage_batch_root_dir"))) / batch_date
     batch_dir.mkdir(parents=True, exist_ok=True)
 
@@ -176,6 +231,51 @@ def _build_batch_data_paths(app_config: object) -> tuple[Path, Path, Path, Path]
         batch_dir / orders_json_name,
         batch_dir / phones_json_name,
     )
+
+
+def _load_recipients_from_batch_results(
+    *,
+    batch_root_dir: str | Path,
+    batch_date: str,
+    include_statuses: tuple[str, ...],
+) -> tuple[list[str], str | None]:
+    replay_batch_dir = Path(batch_root_dir) / batch_date
+    replay_results_path = replay_batch_dir / "results.json"
+    if not replay_results_path.exists():
+        raise FileNotFoundError(f"未找到指定批次结果文件：{replay_results_path}")
+
+    payload = json.loads(replay_results_path.read_text(encoding="utf-8"))
+    records = payload.get("records", [])
+    if not isinstance(records, list):
+        raise ValueError(f"批次结果文件格式异常：{replay_results_path}")
+
+    target_statuses = {item.lower() for item in include_statuses}
+    recipients: list[str] = []
+    messages: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        status = str(record.get("delivery_status", "")).strip().lower()
+        if status not in target_statuses:
+            continue
+        recipient = str(record.get("recipient", "")).strip()
+        if not recipient:
+            continue
+        recipients.append(recipient)
+        message = str(record.get("message", "") or "")
+        if message:
+            messages.append(message)
+
+    unique_recipients = list(dict.fromkeys(recipients))
+    if not unique_recipients:
+        raise ValueError(
+            "指定批次中未找到可重跑收件人。"
+            f"批次={batch_date}，筛选状态={','.join(include_statuses)}"
+        )
+
+    unique_messages = list(dict.fromkeys(messages))
+    inferred_message = unique_messages[0] if len(unique_messages) == 1 else None
+    return unique_recipients, inferred_message
 
 
 def _build_failure_reason_lines(send_results: list[Any], top_n: int = 5) -> list[str]:
@@ -306,18 +406,11 @@ def _send_dingtalk_summary_if_configured(
 
 
 def main() -> int:
+    cli_args = _parse_cli_args()
     try:
         config = load_runtime_config()
     except Exception as exc:  # noqa: BLE001
         print(f"配置读取失败: {exc}")
-        return 2
-
-    web_login = config.get("web_login")
-    if not isinstance(web_login, dict):
-        print(
-            "未检测到网页登录配置，请在 .env 中同时配置 "
-            "LINGXING_WEB_ACCOUNT 和 LINGXING_WEB_PASSWORD"
-        )
         return 2
 
     batch_dir: Path | None = None
@@ -325,77 +418,122 @@ def main() -> int:
     send_results: list[Any] = []
     app_config: Any = APP_CONFIG
     dingtalk_config: dict[str, str] | None = None
+    rerun_batch_date = _resolve_rerun_batch_date_from_sources(
+        cli_args=cli_args,
+    )
+    rerun_include_statuses = _resolve_rerun_include_statuses_from_sources(
+        cli_args=cli_args,
+    )
 
     try:
         dingtalk_config = config.get("dingtalk_notify") if isinstance(config, dict) else None
         app_config = config["app_config"]  # type: ignore[assignment]
+        if not isinstance(rerun_include_statuses, tuple):
+            rerun_include_statuses = ("failed",)
+        execution_batch_date = (
+            rerun_batch_date.strip()
+            if isinstance(rerun_batch_date, str) and rerun_batch_date.strip()
+            else datetime.now().strftime("%Y-%m-%d")
+        )
         batch_dir, order_export_path_in_batch, orders_json_path_in_batch, phones_json_path_in_batch = (
-            _build_batch_data_paths(app_config)
+            _build_batch_data_paths(app_config, batch_date=execution_batch_date)
         )
         print(f"当前批次目录: {batch_dir.resolve()}")
 
-        web_session = create_lingxing_session_from_login(
-            account=str(web_login["account"]),
-            password=str(web_login["password"]),
-            debug=app_config.print_request_debug,
-        )
-        print(
-            "领星网页登录成功，已获取会话Cookie："
-            f" {sorted(cookie.name for cookie in web_session.cookies)}"
-        )
+        recipients: list[str]
+        sending_message = app_config.imessage_text
+        normalize_phone_numbers = True
 
-        switch_lingxing_to_multi_platform(
-            web_session,
-            debug=app_config.print_request_debug,
-        )
-        print("领星登录环境切换成功")
+        if isinstance(rerun_batch_date, str) and rerun_batch_date.strip():
+            recipients, inferred_message = _load_recipients_from_batch_results(
+                batch_root_dir=app_config.imessage_batch_root_dir,
+                batch_date=rerun_batch_date,
+                include_statuses=rerun_include_statuses,
+            )
+            print(
+                "检测到重跑批次参数，进入指定批次重跑模式："
+                f" {rerun_batch_date}（筛选状态：{','.join(rerun_include_statuses)}）"
+            )
+            print(f"指定批次可重跑收件人数: {len(recipients)}")
+            if inferred_message:
+                sending_message = inferred_message
+                print("重跑模式自动复用该批次记录中的消息文案。")
+            else:
+                print("重跑记录存在多种消息文案，改用当前配置的 IMESSAGE_TEXT。")
+        else:
+            web_login = config.get("web_login")
+            if not isinstance(web_login, dict):
+                print(
+                    "未检测到网页登录配置，请在 .env 中同时配置 "
+                    "LINGXING_WEB_ACCOUNT 和 LINGXING_WEB_PASSWORD"
+                )
+                return 2
 
-        start_time, end_time = _build_order_export_range(app_config.lookback_days)
-        export_path = export_and_download_order_management_report(
-            session=web_session,
-            start_time=start_time,
-            end_time=end_time,
-            save_path=str(order_export_path_in_batch),
-            debug=app_config.print_request_debug,
-        )
-        print(f"订单管理导出成功: {Path(export_path).resolve()}")
+            web_session = create_lingxing_session_from_login(
+                account=str(web_login["account"]),
+                password=str(web_login["password"]),
+                debug=app_config.print_request_debug,
+            )
+            print(
+                "领星网页登录成功，已获取会话Cookie："
+                f" {sorted(cookie.name for cookie in web_session.cookies)}"
+            )
 
-        orders = parse_order_management_export_file(export_path)
-        phones = extract_phone_numbers_from_order_records(orders)
-        write_json(orders_json_path_in_batch, orders)
-        write_json(phones_json_path_in_batch, phones)
+            switch_lingxing_to_multi_platform(
+                web_session,
+                debug=app_config.print_request_debug,
+            )
+            print("领星登录环境切换成功")
 
-        print(f"订单解析完成: {len(orders)} 条")
-        print(f"提取到不重复手机号: {len(phones)}")
-        print(f"订单JSON已保存至: {orders_json_path_in_batch.resolve()}")
-        print(f"手机号JSON已保存至: {phones_json_path_in_batch.resolve()}")
+            start_time, end_time = _build_order_export_range(app_config.lookback_days)
+            export_path = export_and_download_order_management_report(
+                session=web_session,
+                start_time=start_time,
+                end_time=end_time,
+                save_path=str(order_export_path_in_batch),
+                debug=app_config.print_request_debug,
+            )
+            print(f"订单管理导出成功: {Path(export_path).resolve()}")
+
+            orders = parse_order_management_export_file(export_path)
+            phones = extract_phone_numbers_from_order_records(orders)
+            write_json(orders_json_path_in_batch, orders)
+            write_json(phones_json_path_in_batch, phones)
+
+            print(f"订单解析完成: {len(orders)} 条")
+            print(f"提取到不重复手机号: {len(phones)}")
+            print(f"订单JSON已保存至: {orders_json_path_in_batch.resolve()}")
+            print(f"手机号JSON已保存至: {phones_json_path_in_batch.resolve()}")
+
+            imessage_test_usernames = config.get("imessage_test_usernames")
+            test_usernames = (
+                imessage_test_usernames
+                if isinstance(imessage_test_usernames, list)
+                else []
+            )
+            recipients = test_usernames if test_usernames else phones
+            normalize_phone_numbers = not bool(test_usernames)
+            if test_usernames:
+                print(
+                    "检测到 IMESSAGE_TEST_USERNAMES，进入测试用户名发送模式，"
+                    f"将按指定列表发送（{len(test_usernames)}个目标）"
+                )
 
         if not app_config.imessage_send_enabled and not app_config.imessage_dry_run:
             return 0
 
-        imessage_test_usernames = config.get("imessage_test_usernames")
-        test_usernames = (
-            imessage_test_usernames
-            if isinstance(imessage_test_usernames, list)
-            else []
-        )
-        recipients = test_usernames if test_usernames else phones
         recipients_count = len(recipients)
-        if test_usernames:
-            print(
-                "检测到 IMESSAGE_TEST_USERNAMES，进入测试用户名发送模式，"
-                f"将按指定列表发送（{len(test_usernames)}个目标）"
-            )
 
         send_results = send_imessages_with_risk_control(
             recipients,
-            message=app_config.imessage_text,
+            message=sending_message,
             dry_run=app_config.imessage_dry_run,
             max_send_count=app_config.imessage_max_send_count,
             rules=app_config.imessage_risk_control,
             state_path=app_config.imessage_state_path,
-            normalize_phone_numbers=not bool(test_usernames),
+            normalize_phone_numbers=normalize_phone_numbers,
             batch_root_dir=app_config.imessage_batch_root_dir,
+            batch_date=execution_batch_date,
             delivery_check_timeout_seconds=app_config.imessage_delivery_check_timeout_seconds,
             delivery_check_interval_seconds=app_config.imessage_delivery_check_interval_seconds,
             delivery_check_lookback_seconds=app_config.imessage_delivery_check_lookback_seconds,

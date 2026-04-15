@@ -65,8 +65,13 @@ def _batch_record_key(recipient: str, message: str) -> str:
     return f"{recipient}\n{message}"
 
 
-def _resolve_batch_paths(batch_root_dir: str | Path) -> tuple[str, Path, Path]:
-    batch_date = datetime.now().strftime("%Y-%m-%d")
+def _resolve_batch_paths(
+    batch_root_dir: str | Path,
+    *,
+    batch_date: str | None = None,
+) -> tuple[str, Path, Path]:
+    if batch_date is None:
+        batch_date = datetime.now().strftime("%Y-%m-%d")
     batch_dir = Path(batch_root_dir) / batch_date
     batch_dir.mkdir(parents=True, exist_ok=True)
     return batch_date, batch_dir / "results.json", batch_dir / "events.jsonl"
@@ -495,6 +500,7 @@ def send_imessages_with_risk_control(
     state_path: str | Path = ".imessage_send_history.json",
     normalize_phone_numbers: bool = True,
     batch_root_dir: str | Path = "imessage_batches",
+    batch_date: str | None = None,
     delivery_check_timeout_seconds: int = 45,
     delivery_check_interval_seconds: int = 3,
     delivery_check_lookback_seconds: int = 600,
@@ -509,7 +515,10 @@ def send_imessages_with_risk_control(
         unique_phones = list(dict.fromkeys((phone or "").strip() for phone in phones if (phone or "").strip()))
     state_file = Path(state_path)
     history = _load_history(state_file)
-    batch_date, batch_results_path, batch_events_path = _resolve_batch_paths(batch_root_dir)
+    batch_date, batch_results_path, batch_events_path = _resolve_batch_paths(
+        batch_root_dir,
+        batch_date=batch_date,
+    )
     batch_payload = _load_batch_results(batch_results_path, batch_date)
     batch_records_by_key = _index_batch_records(batch_payload.get("records", []))
     now = datetime.now()
@@ -543,7 +552,7 @@ def send_imessages_with_risk_control(
     results: list[SendResult] = []
     for phone in queued_phones:
         if phone in already_processed_in_batch:
-            detail = f"跳过：当日批次中该收件人已存在非失败状态记录（{batch_date}）"
+            detail = f"跳过：该批次中收件人已存在非失败状态记录（{batch_date}）"
             results.append(SendResult(phone=phone, status="skipped_processed", detail=detail))
             _append_batch_event(
                 batch_events_path,
