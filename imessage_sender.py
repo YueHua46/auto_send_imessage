@@ -1,46 +1,30 @@
 from __future__ import annotations
 
 import json
-import random
-import shutil
-import subprocess
-import sys
 import time
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+
+import requests
 
 
 class IMessageSendError(RuntimeError):
-    """当 iMessage 发送或 imsg 调用失败时抛出。"""
+    """当 iMessage 发送或 BlueBubbles 调用失败时抛出。"""
 
 
 @dataclass(slots=True)
-class IMessageRiskControl:
-    startup_delay_min_seconds: int = 20
-    startup_delay_max_seconds: int = 90
-    min_delay_between_messages_seconds: int = 35
-    max_delay_between_messages_seconds: int = 80
-    batch_size: int = 5
-    batch_pause_min_seconds: int = 180
-    batch_pause_max_seconds: int = 420
-    daily_limit: int = 100
-    cooldown_hours: int = 72
-    active_hours_start: int = 9
-    active_hours_end: int = 20
-
-
-@dataclass(slots=True)
-class IMsgCLIConfig:
-    binary: str = "imsg"
-    service: str = "auto"
-    region: str = "US"
-    send_timeout_seconds: int = 60
+class BlueBubblesAPIConfig:
+    base_url: str = "http://127.0.0.1:1234"
+    password: str = ""
+    auth_param_name: str = "guid"
+    send_timeout_seconds: int = 20
     read_timeout_seconds: int = 30
-    chats_limit: int = 200
-    history_limit: int = 50
-    watch_debounce_milliseconds: int = 250
+    verify_ssl: bool = True
+    recent_messages_limit: int = 25
 
 
 @dataclass(slots=True)
@@ -60,67 +44,17 @@ class DeliveryCheckResult:
 
 
 @dataclass(slots=True)
-class IMsgCommandResult:
-    stdout: str
-    stderr: str
-    returncode: int | None
-    timed_out: bool = False
-
-
-@dataclass(slots=True)
-class IMsgChat:
-    id: int
-    identifier: str
-    service: str
-    last_message_at: str | None = None
-    name: str | None = None
-
-
-@dataclass(slots=True)
-class IMsgMessage:
-    id: int | None
-    chat_id: int | None
-    guid: str | None
-    sender: str | None
-    is_from_me: bool
-    text: str
-    created_at: str | None
-
-
-@dataclass(slots=True)
-class IMsgSendContext:
-    chat_id: int | None
-    anchor_message_id: int | None
-    attempted_at_utc: datetime
+class BlueBubblesSendContext:
+    recipient: str
+    message: str
+    attempted_at_ms: int
+    temp_guid: str
+    message_guid: str | None = None
+    transport_error: str | None = None
 
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _to_imsg_iso(value: datetime) -> str:
-    utc_value = value.astimezone(timezone.utc).replace(microsecond=0)
-    return utc_value.isoformat().replace("+00:00", "Z")
-
-
-def _parse_iso_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    normalized = value.strip()
-    if not normalized:
-        return None
-    normalized = normalized.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _batch_record_key(recipient: str, message: str) -> str:
@@ -266,474 +200,23 @@ def _coerce_int(value: object) -> int | None:
         return None
 
 
-def _coerce_bool(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() not in {"", "0", "false", "none", "null"}
-    return bool(value)
-
-
-def _resolve_cli_binary(binary: str) -> str | None:
-    candidate = (binary or "").strip()
-    if not candidate:
-        return None
-    if any(sep in candidate for sep in ("/", "\\")):
-        path = Path(candidate).expanduser()
-        return str(path) if path.exists() else None
-    return shutil.which(candidate)
-
-
-def _build_imsg_send_command(
+def _prepare_unique_recipients(
+    recipients: list[str],
     *,
-    binary: str,
-    recipient: str,
-    message: str,
-    cli_config: IMsgCLIConfig,
+    normalize_phone_numbers: bool,
 ) -> list[str]:
-    command = [
-        binary,
-        "send",
-        "--to",
-        recipient,
-        "--text",
-        message,
-        "--service",
-        cli_config.service,
-    ]
-    region = cli_config.region.strip()
-    if region:
-        command.extend(["--region", region])
-    return command
-
-
-def _validate_imsg_cli(cli_config: IMsgCLIConfig) -> str:
-    if sys.platform != "darwin":
-        raise IMessageSendError("仅支持在 macOS 下通过 imsg 自动发送 iMessage。")
-
-    resolved_binary = _resolve_cli_binary(cli_config.binary)
-    if resolved_binary is None:
-        raise IMessageSendError(
-            f"未找到 imsg 可执行文件：{cli_config.binary}。"
-            "请先安装 imsg，或通过 IMESSAGE_IMSG_BINARY 指定路径。"
-        )
-
-    try:
-        completed = subprocess.run(
-            [resolved_binary, "--version"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=max(cli_config.send_timeout_seconds, 1),
-        )
-    except OSError as exc:
-        raise IMessageSendError(f"启动 imsg 失败：{exc}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise IMessageSendError("检查 imsg 版本超时，请确认命令可正常执行。") from exc
-
-    if completed.returncode != 0:
-        stderr = (completed.stderr or completed.stdout or "").strip()
-        raise IMessageSendError(stderr or f"imsg --version 非零退出码: {completed.returncode}")
-    return resolved_binary
-
-
-def _run_imsg_command(
-    *,
-    resolved_binary: str,
-    cli_config: IMsgCLIConfig,
-    args: list[str],
-    timeout_seconds: int,
-    allow_timeout: bool = False,
-    require_success: bool = True,
-) -> IMsgCommandResult:
-    command = [resolved_binary, *args]
-    try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=max(timeout_seconds, 1),
-        )
-    except OSError as exc:
-        raise IMessageSendError(f"调用 imsg 失败：{exc}") from exc
-    except subprocess.TimeoutExpired as exc:
-        if allow_timeout:
-            return IMsgCommandResult(
-                stdout=exc.stdout or "",
-                stderr=exc.stderr or "",
-                returncode=None,
-                timed_out=True,
-            )
-        raise IMessageSendError(
-            f"imsg {' '.join(args[:2])} 超时（>{timeout_seconds} 秒）。"
-        ) from exc
-
-    stdout = completed.stdout or ""
-    stderr = completed.stderr or ""
-    if require_success and completed.returncode != 0:
-        detail = stderr.strip() or stdout.strip() or f"非零退出码: {completed.returncode}"
-        raise IMessageSendError(f"imsg {' '.join(args[:2])} 失败：{detail}")
-    return IMsgCommandResult(
-        stdout=stdout,
-        stderr=stderr,
-        returncode=completed.returncode,
-        timed_out=False,
-    )
-
-
-def _parse_ndjson_objects(payload: str) -> list[dict[str, Any]]:
-    objects: list[dict[str, Any]] = []
-    for raw_line in payload.splitlines():
-        line = raw_line.strip()
-        if not line:
+    prepared: list[str] = []
+    seen: set[str] = set()
+    for raw in recipients:
+        recipient = (raw or "").strip()
+        if not recipient:
             continue
-        if not line.startswith("{"):
+        dedupe_key = _recipient_identity_key(recipient) if normalize_phone_numbers else recipient
+        if not dedupe_key or dedupe_key in seen:
             continue
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            objects.append(parsed)
-    return objects
-
-
-def _parse_imsg_chats(payload: str) -> list[IMsgChat]:
-    chats: list[IMsgChat] = []
-    for item in _parse_ndjson_objects(payload):
-        chat_id = _coerce_int(item.get("id"))
-        if chat_id is None:
-            continue
-        chats.append(
-            IMsgChat(
-                id=chat_id,
-                identifier=str(item.get("identifier", "") or "").strip(),
-                service=str(item.get("service", "") or "").strip(),
-                last_message_at=str(item.get("last_message_at", "") or "").strip() or None,
-                name=str(item.get("name", "") or "").strip() or None,
-            )
-        )
-    return chats
-
-
-def _parse_imsg_messages(payload: str) -> list[IMsgMessage]:
-    messages: list[IMsgMessage] = []
-    for item in _parse_ndjson_objects(payload):
-        messages.append(
-            IMsgMessage(
-                id=_coerce_int(item.get("id")),
-                chat_id=_coerce_int(item.get("chat_id")),
-                guid=str(item.get("guid", "") or "").strip() or None,
-                sender=str(item.get("sender", "") or "").strip() or None,
-                is_from_me=_coerce_bool(item.get("is_from_me")),
-                text=str(item.get("text", "") or ""),
-                created_at=str(item.get("created_at", "") or "").strip() or None,
-            )
-        )
-    return messages
-
-
-def _list_imsg_chats(
-    *,
-    resolved_binary: str,
-    cli_config: IMsgCLIConfig,
-) -> list[IMsgChat]:
-    result = _run_imsg_command(
-        resolved_binary=resolved_binary,
-        cli_config=cli_config,
-        args=["chats", "--limit", str(max(cli_config.chats_limit, 1)), "--json"],
-        timeout_seconds=max(cli_config.read_timeout_seconds, 1),
-    )
-    return _parse_imsg_chats(result.stdout)
-
-
-def _list_imsg_history(
-    *,
-    resolved_binary: str,
-    cli_config: IMsgCLIConfig,
-    chat_id: int,
-    start_at: datetime | None = None,
-    limit: int | None = None,
-) -> list[IMsgMessage]:
-    args = [
-        "history",
-        "--chat-id",
-        str(chat_id),
-        "--limit",
-        str(max(limit or cli_config.history_limit, 1)),
-        "--json",
-    ]
-    if start_at is not None:
-        args.extend(["--start", _to_imsg_iso(start_at)])
-    result = _run_imsg_command(
-        resolved_binary=resolved_binary,
-        cli_config=cli_config,
-        args=args,
-        timeout_seconds=max(cli_config.read_timeout_seconds, 1),
-    )
-    return _parse_imsg_messages(result.stdout)
-
-
-def _select_chat_for_recipient(recipient: str, chats: list[IMsgChat]) -> IMsgChat | None:
-    scored: list[tuple[float, float, IMsgChat]] = []
-    for chat in chats:
-        score = 0.0
-        if _recipient_matches(chat.identifier, recipient):
-            score += 10
-        if chat.service.lower() == "imessage":
-            score += 1
-        if score <= 0:
-            continue
-        last_ts = _parse_iso_datetime(chat.last_message_at)
-        scored.append((score, last_ts.timestamp() if last_ts is not None else 0.0, chat))
-    if not scored:
-        return None
-    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return scored[0][2]
-
-
-def _max_message_id(messages: list[IMsgMessage]) -> int | None:
-    ids = [message.id for message in messages if message.id is not None]
-    return max(ids) if ids else None
-
-
-def _find_matching_outgoing_message(
-    messages: list[IMsgMessage],
-    *,
-    expected_text: str,
-    attempted_after_utc: datetime,
-    min_message_id: int | None = None,
-) -> IMsgMessage | None:
-    expected_normalized = _normalize_message_text(expected_text)
-    best_match: tuple[float, IMsgMessage] | None = None
-    for message in messages:
-        if not message.is_from_me:
-            continue
-        if min_message_id is not None and message.id is not None and message.id <= min_message_id:
-            continue
-        created_at = _parse_iso_datetime(message.created_at)
-        if created_at is not None and created_at < attempted_after_utc - timedelta(seconds=5):
-            continue
-
-        score = 0.0
-        candidate_text = _normalize_message_text(message.text)
-        if candidate_text == expected_normalized:
-            score += 10
-        elif candidate_text and expected_normalized and (
-            candidate_text in expected_normalized or expected_normalized in candidate_text
-        ):
-            score += 5
-        else:
-            continue
-
-        if message.id is not None:
-            score += 1
-        if created_at is not None:
-            score += created_at.timestamp() / 1_000_000_000
-
-        if best_match is None or score > best_match[0]:
-            best_match = (score, message)
-    return best_match[1] if best_match is not None else None
-
-
-def _build_send_context(
-    recipient: str,
-    *,
-    resolved_binary: str,
-    cli_config: IMsgCLIConfig,
-) -> IMsgSendContext:
-    attempted_at_utc = _utc_now()
-    try:
-        chats = _list_imsg_chats(resolved_binary=resolved_binary, cli_config=cli_config)
-        chat = _select_chat_for_recipient(recipient, chats)
-        if chat is None:
-            return IMsgSendContext(chat_id=None, anchor_message_id=None, attempted_at_utc=attempted_at_utc)
-        history = _list_imsg_history(
-            resolved_binary=resolved_binary,
-            cli_config=cli_config,
-            chat_id=chat.id,
-            limit=1,
-        )
-        return IMsgSendContext(
-            chat_id=chat.id,
-            anchor_message_id=_max_message_id(history),
-            attempted_at_utc=attempted_at_utc,
-        )
-    except Exception:
-        # 发送前上下文获取失败不阻断发送，发送后再走 history 兜底确认。
-        return IMsgSendContext(chat_id=None, anchor_message_id=None, attempted_at_utc=attempted_at_utc)
-
-
-def _watch_for_confirmation(
-    *,
-    chat_id: int,
-    expected_text: str,
-    attempted_after_utc: datetime,
-    min_message_id: int | None,
-    resolved_binary: str,
-    cli_config: IMsgCLIConfig,
-    timeout_seconds: int,
-) -> DeliveryCheckResult | None:
-    args = [
-        "watch",
-        "--chat-id",
-        str(chat_id),
-        "--json",
-        "--debounce",
-        f"{max(cli_config.watch_debounce_milliseconds, 1)}ms",
-    ]
-    if min_message_id is not None:
-        args.extend(["--since-rowid", str(min_message_id)])
-
-    try:
-        result = _run_imsg_command(
-            resolved_binary=resolved_binary,
-            cli_config=cli_config,
-            args=args,
-            timeout_seconds=max(timeout_seconds, 1),
-            allow_timeout=True,
-            require_success=False,
-        )
-    except Exception as exc:
-        return DeliveryCheckResult(
-            status="sent_not_confirmed",
-            detail=f"imsg watch 启动失败：{exc}",
-            error=str(exc),
-            raw_error=str(exc),
-        )
-
-    if result.returncode not in (0, None):
-        detail = result.stderr.strip() or result.stdout.strip() or "imsg watch 非零退出"
-        return DeliveryCheckResult(
-            status="sent_not_confirmed",
-            detail=f"imsg watch 执行异常：{detail}",
-            error=detail,
-            raw_error=detail,
-        )
-
-    messages = _parse_imsg_messages(result.stdout)
-    matched = _find_matching_outgoing_message(
-        messages,
-        expected_text=expected_text,
-        attempted_after_utc=attempted_after_utc,
-        min_message_id=min_message_id,
-    )
-    if matched is None:
-        return None
-
-    detail = f"消息已在 imsg watch 中确认（chat_id={chat_id}"
-    if matched.id is not None:
-        detail += f", id={matched.id}"
-    detail += "）。"
-    return DeliveryCheckResult(status="confirmed_in_imsg", detail=detail)
-
-
-def _confirm_via_history(
-    recipient: str,
-    message: str,
-    *,
-    send_context: IMsgSendContext,
-    resolved_binary: str,
-    cli_config: IMsgCLIConfig,
-    timeout_seconds: int,
-    interval_seconds: int,
-    lookback_seconds: int,
-    prior_watch_detail: DeliveryCheckResult | None = None,
-) -> DeliveryCheckResult:
-    deadline = time.time() + max(timeout_seconds, 1)
-    lookback_start = send_context.attempted_at_utc - timedelta(seconds=max(lookback_seconds, 1))
-    last_detail = "imsg 尚未返回匹配消息。"
-    last_error = prior_watch_detail.error if prior_watch_detail is not None else None
-    last_raw_error = prior_watch_detail.raw_error if prior_watch_detail is not None else None
-
-    while True:
-        try:
-            chats = _list_imsg_chats(resolved_binary=resolved_binary, cli_config=cli_config)
-            chat = _select_chat_for_recipient(recipient, chats)
-            if chat is None:
-                last_detail = "发送后尚未在 imsg chats 中解析到目标会话。"
-            else:
-                history = _list_imsg_history(
-                    resolved_binary=resolved_binary,
-                    cli_config=cli_config,
-                    chat_id=chat.id,
-                    start_at=lookback_start,
-                )
-                matched = _find_matching_outgoing_message(
-                    history,
-                    expected_text=message,
-                    attempted_after_utc=send_context.attempted_at_utc,
-                    min_message_id=send_context.anchor_message_id,
-                )
-                if matched is not None:
-                    detail = f"消息已在 imsg history 中确认（chat_id={chat.id}"
-                    if matched.id is not None:
-                        detail += f", id={matched.id}"
-                    detail += "）。"
-                    return DeliveryCheckResult(status="confirmed_in_imsg", detail=detail)
-                last_detail = f"已找到 chat_id={chat.id}，但 history 中尚未出现本次外发消息。"
-        except Exception as exc:
-            last_detail = f"查询 imsg history 失败：{exc}"
-            last_error = str(exc)
-            last_raw_error = str(exc)
-
-        if time.time() >= deadline:
-            break
-        time.sleep(max(interval_seconds, 1))
-
-    detail = (
-        f"imsg 在 {max(timeout_seconds, 1)} 秒内未确认消息进入 history。"
-        f"最后观测：{last_detail}"
-    )
-    if prior_watch_detail is not None and prior_watch_detail.detail:
-        detail = f"{detail}；watch观测：{prior_watch_detail.detail}"
-    return DeliveryCheckResult(
-        status="sent_not_confirmed",
-        detail=detail,
-        error=last_error,
-        raw_error=last_raw_error,
-    )
-
-
-def _confirm_delivery_status(
-    recipient: str,
-    message: str,
-    *,
-    send_context: IMsgSendContext,
-    resolved_binary: str,
-    cli_config: IMsgCLIConfig,
-    timeout_seconds: int,
-    interval_seconds: int,
-    lookback_seconds: int,
-) -> DeliveryCheckResult:
-    watch_result: DeliveryCheckResult | None = None
-    if send_context.chat_id is not None:
-        watch_result = _watch_for_confirmation(
-            chat_id=send_context.chat_id,
-            expected_text=message,
-            attempted_after_utc=send_context.attempted_at_utc,
-            min_message_id=send_context.anchor_message_id,
-            resolved_binary=resolved_binary,
-            cli_config=cli_config,
-            timeout_seconds=timeout_seconds,
-        )
-        if watch_result is not None and watch_result.status == "confirmed_in_imsg":
-            return watch_result
-
-    return _confirm_via_history(
-        recipient,
-        message,
-        send_context=send_context,
-        resolved_binary=resolved_binary,
-        cli_config=cli_config,
-        timeout_seconds=timeout_seconds,
-        interval_seconds=interval_seconds,
-        lookback_seconds=lookback_seconds,
-        prior_watch_detail=watch_result,
-    )
+        seen.add(dedupe_key)
+        prepared.append(recipient)
+    return prepared
 
 
 def _load_history(state_path: Path) -> dict[str, list[dict[str, str]]]:
@@ -746,109 +229,305 @@ def _save_history(state_path: Path, payload: dict[str, list[dict[str, str]]]) ->
     state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _can_send_now(rules: IMessageRiskControl, now: datetime) -> tuple[bool, str]:
-    if not (rules.active_hours_start <= now.hour < rules.active_hours_end):
-        return False, (
-            f"当前本地时间 {now.hour:02d}:00 不在允许自动发送时间段 "
-            f"{rules.active_hours_start:02d}:00-{rules.active_hours_end:02d}:00 内。"
+def _normalize_base_url(base_url: str) -> str:
+    return base_url.strip().rstrip("/")
+
+
+def _auth_params(api_config: BlueBubblesAPIConfig) -> dict[str, str]:
+    return {api_config.auth_param_name: api_config.password}
+
+
+def _build_chat_guid(recipient: str) -> str:
+    return f"iMessage;-;{recipient.strip()}"
+
+
+def _request_json(
+    *,
+    method: str,
+    path: str,
+    api_config: BlueBubblesAPIConfig,
+    timeout_seconds: int,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not api_config.password.strip():
+        raise IMessageSendError("缺少 BLUEBUBBLES_PASSWORD，无法调用 BlueBubbles API。")
+
+    merged_params: dict[str, Any] = _auth_params(api_config)
+    if params:
+        merged_params.update(params)
+
+    url = f"{_normalize_base_url(api_config.base_url)}{path}"
+    session = requests.Session()
+    hostname = (urlparse(url).hostname or "").strip().lower()
+    if hostname in {"127.0.0.1", "localhost", "::1"}:
+        session.trust_env = False
+    try:
+        response = session.request(
+            method=method,
+            url=url,
+            params=merged_params,
+            json=json_body,
+            timeout=max(timeout_seconds, 1),
+            verify=api_config.verify_ssl,
         )
-    return True, ""
+    except requests.RequestException as exc:
+        raise IMessageSendError(f"请求 BlueBubbles 失败：{exc}") from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise IMessageSendError(
+            f"BlueBubbles 返回了非 JSON 响应（HTTP {response.status_code}）。"
+        ) from exc
+
+    status = _coerce_int(payload.get("status"))
+    message = str(payload.get("message", "") or "").strip()
+    if response.status_code >= 400 or status is None or status >= 400:
+        error_payload = payload.get("error")
+        error_text = ""
+        if isinstance(error_payload, dict):
+            error_text = str(error_payload.get("error", "") or error_payload.get("type", "")).strip()
+        detail = error_text or message or f"HTTP {response.status_code}"
+        raise IMessageSendError(f"BlueBubbles API 调用失败：{detail}")
+    return payload
 
 
-def _recent_history_entries(
-    history: dict[str, list[dict[str, str]]],
+def _read_recent_log_lines(log_path: Path, *, limit: int = 300) -> list[str]:
+    if not log_path.exists():
+        return []
+    try:
+        return log_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-limit:]
+    except Exception:
+        return []
+
+
+def _confirm_delivery_in_server_log(
+    send_context: BlueBubblesSendContext,
     *,
-    now_ts: float,
-    rules: IMessageRiskControl,
-) -> tuple[list[dict[str, str]], set[str]]:
-    recent_day_entries: list[dict[str, str]] = []
-    cooling_down_recipient_keys: set[str] = set()
-    for entry in history.get("messages", []):
-        sent_ts = float(entry["timestamp"])
-        if now_ts - sent_ts <= 24 * 60 * 60:
-            recent_day_entries.append(entry)
-        if now_ts - sent_ts <= rules.cooldown_hours * 60 * 60:
-            identity_key = _recipient_identity_key(str(entry.get("phone", "")).strip())
-            if identity_key:
-                cooling_down_recipient_keys.add(identity_key)
-    return recent_day_entries, cooling_down_recipient_keys
+    log_path: Path | None = None,
+) -> DeliveryCheckResult | None:
+    effective_log_path = log_path or (Path.home() / "Library/Logs/bluebubbles-server/main.log")
+    lines = _read_recent_log_lines(effective_log_path)
+    if not lines:
+        return None
+
+    await_marker = f"tempGuid: {send_context.temp_guid}"
+    last_await_index = -1
+    for index, line in enumerate(lines):
+        if await_marker in line:
+            last_await_index = index
+
+    if last_await_index < 0:
+        return None
+
+    for line in lines[last_await_index : last_await_index + 20]:
+        if "Delivered message from [You]" in line or "New Message from You" in line:
+            return DeliveryCheckResult(
+                status="confirmed_in_bluebubbles",
+                detail=(
+                    "消息已在 BlueBubbles 服务日志中确认。"
+                    f" tempGuid={send_context.temp_guid}"
+                ),
+            )
+    return None
 
 
-def _prepare_unique_recipients(
-    recipients: list[str],
+def _validate_bluebubbles_server(api_config: BlueBubblesAPIConfig) -> None:
+    _request_json(
+        method="GET",
+        path="/api/v1/ping",
+        api_config=api_config,
+        timeout_seconds=max(api_config.read_timeout_seconds, 1),
+    )
+
+
+def get_bluebubbles_server_info(
     *,
-    normalize_phone_numbers: bool,
-) -> list[str]:
-    prepared: list[str] = []
-    seen: set[str] = set()
-    for raw in recipients:
-        recipient = (raw or "").strip()
-        if not recipient:
+    api_config: BlueBubblesAPIConfig | None = None,
+) -> dict[str, Any]:
+    config = api_config or BlueBubblesAPIConfig()
+    return _request_json(
+        method="GET",
+        path="/api/v1/server/info",
+        api_config=config,
+        timeout_seconds=max(config.read_timeout_seconds, 1),
+    )
+
+
+def _message_handle_address(item: dict[str, Any]) -> str | None:
+    handle = item.get("handle")
+    if isinstance(handle, dict):
+        address = str(handle.get("address", "") or "").strip()
+        if address:
+            return address
+
+    chats = item.get("chats")
+    if isinstance(chats, list):
+        for chat in chats:
+            if not isinstance(chat, dict):
+                continue
+            chat_identifier = str(chat.get("chatIdentifier", "") or "").strip()
+            if chat_identifier:
+                return chat_identifier
+    return None
+
+
+def _find_matching_sent_message(
+    messages: list[dict[str, Any]],
+    *,
+    recipient: str,
+    expected_text: str,
+    attempted_after_ms: int,
+    expected_guid: str | None,
+) -> dict[str, Any] | None:
+    expected_normalized = _normalize_message_text(expected_text)
+    for item in messages:
+        if not isinstance(item, dict):
             continue
-        if normalize_phone_numbers:
-            dedupe_key = _recipient_identity_key(recipient)
-        else:
-            dedupe_key = recipient
-        if not dedupe_key or dedupe_key in seen:
+        if not item.get("isFromMe"):
             continue
-        seen.add(dedupe_key)
-        prepared.append(recipient)
-    return prepared
+
+        guid = str(item.get("guid", "") or "").strip()
+        if expected_guid and guid and guid == expected_guid:
+            return item
+
+        created_at = _coerce_int(item.get("dateCreated")) or 0
+        if created_at and created_at < attempted_after_ms - 5_000:
+            continue
+
+        address = _message_handle_address(item)
+        if address and not _recipient_matches(address, recipient):
+            continue
+
+        candidate_text = _normalize_message_text(str(item.get("text", "") or ""))
+        if candidate_text == expected_normalized:
+            return item
+    return None
+
+
+def _confirm_delivery_status(
+    recipient: str,
+    message: str,
+    *,
+    send_context: BlueBubblesSendContext,
+    api_config: BlueBubblesAPIConfig,
+    timeout_seconds: int,
+    interval_seconds: int,
+) -> DeliveryCheckResult:
+    deadline = time.time() + max(timeout_seconds, 1)
+    last_error: str | None = None
+    last_detail = "尚未在 BlueBubbles 最近消息列表中发现匹配的外发记录。"
+
+    while True:
+        log_delivery = _confirm_delivery_in_server_log(send_context)
+        if log_delivery is not None:
+            return log_delivery
+
+        try:
+            payload = _request_json(
+                method="GET",
+                path="/api/v1/message",
+                api_config=api_config,
+                timeout_seconds=max(api_config.read_timeout_seconds, 1),
+                params={
+                    "limit": max(api_config.recent_messages_limit, 1),
+                    "offset": 0,
+                    "sort": "DESC",
+                    "after": max(send_context.attempted_at_ms - 10_000, 0),
+                },
+            )
+            data = payload.get("data")
+            messages = data if isinstance(data, list) else []
+            matched = _find_matching_sent_message(
+                messages,
+                recipient=recipient,
+                expected_text=message,
+                attempted_after_ms=send_context.attempted_at_ms,
+                expected_guid=send_context.message_guid,
+            )
+            if matched is not None:
+                guid = str(matched.get("guid", "") or "").strip()
+                detail = "消息已在 BlueBubbles recent messages 中确认。"
+                if guid:
+                    detail = f"{detail} guid={guid}"
+                return DeliveryCheckResult(
+                    status="confirmed_in_bluebubbles",
+                    detail=detail,
+                )
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            last_detail = f"轮询 BlueBubbles recent messages 失败：{exc}"
+
+        if time.time() >= deadline:
+            break
+        time.sleep(max(interval_seconds, 1))
+
+    return DeliveryCheckResult(
+        status="sent_not_confirmed",
+        detail=(
+            f"BlueBubbles 在 {max(timeout_seconds, 1)} 秒内未确认消息出现在 recent messages。"
+            f"最后观测：{last_detail}"
+        ),
+        error=last_error,
+        raw_error=last_error,
+    )
 
 
 def send_imessage_once(
     phone: str,
     message: str,
     *,
-    cli_config: IMsgCLIConfig | None = None,
-    resolved_binary: str | None = None,
-) -> None:
-    cli_config = cli_config or IMsgCLIConfig()
-    binary = resolved_binary or _validate_imsg_cli(cli_config)
-    command = _build_imsg_send_command(
-        binary=binary,
+    api_config: BlueBubblesAPIConfig | None = None,
+) -> BlueBubblesSendContext:
+    config = api_config or BlueBubblesAPIConfig()
+    attempted_at_ms = int(time.time() * 1000)
+    temp_guid = f"temp-{uuid.uuid4()}"
+    message_guid: str | None = None
+    transport_error: str | None = None
+    try:
+        payload = _request_json(
+            method="POST",
+            path="/api/v1/message/text",
+            api_config=config,
+            timeout_seconds=max(config.send_timeout_seconds, 1),
+            json_body={
+                "chatGuid": _build_chat_guid(phone),
+                "tempGuid": temp_guid,
+                "message": message,
+            },
+        )
+        data = payload.get("data")
+        if isinstance(data, dict):
+            raw_guid = str(data.get("guid", "") or "").strip()
+            if raw_guid:
+                message_guid = raw_guid
+    except Exception as exc:  # noqa: BLE001
+        transport_error = str(exc)
+
+    return BlueBubblesSendContext(
         recipient=phone,
         message=message,
-        cli_config=cli_config,
+        attempted_at_ms=attempted_at_ms,
+        temp_guid=temp_guid,
+        message_guid=message_guid,
+        transport_error=transport_error,
     )
-    try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=max(cli_config.send_timeout_seconds, 1),
-        )
-    except OSError as exc:
-        raise IMessageSendError(f"调用 imsg 失败：{exc}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise IMessageSendError(
-            f"imsg 发送超时（>{cli_config.send_timeout_seconds} 秒）：{phone}"
-        ) from exc
-
-    if completed.returncode != 0:
-        stderr = (completed.stderr or completed.stdout or "").strip()
-        raise IMessageSendError(stderr or f"imsg send 非零退出码: {completed.returncode}")
 
 
-def send_imessages_with_risk_control(
+def send_imessages(
     phones: list[str],
     message: str = "Hi",
     *,
-    dry_run: bool = False,
-    rules: IMessageRiskControl | None = None,
-    max_send_count: int | None = None,
     state_path: str | Path = ".imessage_send_history.json",
     normalize_phone_numbers: bool = True,
     batch_root_dir: str | Path = "imessage_batches",
     batch_date: str | None = None,
-    cli_config: IMsgCLIConfig | None = None,
+    api_config: BlueBubblesAPIConfig | None = None,
     delivery_check_timeout_seconds: int = 45,
     delivery_check_interval_seconds: int = 3,
-    delivery_check_lookback_seconds: int = 600,
 ) -> list[SendResult]:
-    rules = rules or IMessageRiskControl()
-    cli_config = cli_config or IMsgCLIConfig()
+    api_config = api_config or BlueBubblesAPIConfig()
     unique_recipients = _prepare_unique_recipients(
         phones,
         normalize_phone_numbers=normalize_phone_numbers,
@@ -862,32 +541,13 @@ def send_imessages_with_risk_control(
     )
     batch_payload = _load_batch_results(batch_results_path, batch_date)
     batch_records_by_key = _index_batch_records(batch_payload.get("records", []))
-    now = datetime.now()
-    can_send, reason = _can_send_now(rules, now)
-    if not can_send:
-        raise IMessageSendError(reason)
-
-    now_ts = time.time()
-    recent_day_entries, cooling_down_recipients = _recent_history_entries(
-        history,
-        now_ts=now_ts,
-        rules=rules,
-    )
-    if len(recent_day_entries) >= rules.daily_limit:
-        raise IMessageSendError(
-            f"今日已达发送上限：过去24小时内已发送{len(recent_day_entries)}条消息。"
-        )
-
-    send_budget = rules.daily_limit - len(recent_day_entries)
-    if max_send_count is not None:
-        send_budget = min(send_budget, max_send_count)
-
-    queued_recipients = [
-        recipient
-        for recipient in unique_recipients
-        if _recipient_identity_key(recipient) not in cooling_down_recipients
-    ]
-    skip_statuses_in_batch = {"confirmed_in_imsg", "sent_not_confirmed", "delivered"}
+    queued_recipients = unique_recipients
+    skip_statuses_in_batch = {
+        "confirmed_in_imsg",
+        "confirmed_in_bluebubbles",
+        "sent_not_confirmed",
+        "delivered",
+    }
     already_processed_in_batch = {
         _recipient_identity_key(str(record.get("recipient", "")).strip())
         for record in batch_records_by_key.values()
@@ -916,31 +576,12 @@ def send_imessages_with_risk_control(
         if _recipient_identity_key(recipient) not in already_processed_in_batch
     ]
 
-    if dry_run:
-        dry_run_results = [
-            SendResult(phone=recipient, status="dry_run", detail=f'将会通过 imsg 发送 "{message}"')
-            for recipient in queued_recipients[:send_budget]
-        ]
-        return results + dry_run_results
-
     if not queued_recipients:
         return results
 
-    resolved_imsg_binary = _validate_imsg_cli(cli_config)
-    time.sleep(random.randint(rules.startup_delay_min_seconds, rules.startup_delay_max_seconds))
+    _validate_bluebubbles_server(api_config)
 
-    sent_in_this_run = 0
-    for index, recipient in enumerate(queued_recipients):
-        if sent_in_this_run >= send_budget:
-            results.append(
-                SendResult(phone=recipient, status="skipped", detail="跳过，因为本次发送额度已用尽")
-            )
-            continue
-
-        if sent_in_this_run and sent_in_this_run % rules.batch_size == 0:
-            batch_pause = random.randint(rules.batch_pause_min_seconds, rules.batch_pause_max_seconds)
-            time.sleep(batch_pause)
-
+    for recipient in queued_recipients:
         attempted_at = _now_iso()
         _append_batch_event(
             batch_events_path,
@@ -953,43 +594,52 @@ def send_imessages_with_risk_control(
         )
 
         try:
-            send_context = _build_send_context(
-                recipient,
-                resolved_binary=resolved_imsg_binary,
-                cli_config=cli_config,
-            )
-            send_imessage_once(
+            send_context = send_imessage_once(
                 recipient,
                 message,
-                cli_config=cli_config,
-                resolved_binary=resolved_imsg_binary,
+                api_config=api_config,
             )
-            sent_in_this_run += 1
-            history.setdefault("messages", []).append(
-                {
-                    "phone": recipient,
-                    "timestamp": str(time.time()),
-                    "message": message,
-                }
-            )
-            _save_history(state_file, history)
 
             delivery_status = _confirm_delivery_status(
                 recipient,
                 message,
                 send_context=send_context,
-                resolved_binary=resolved_imsg_binary,
-                cli_config=cli_config,
+                api_config=api_config,
                 timeout_seconds=delivery_check_timeout_seconds,
                 interval_seconds=delivery_check_interval_seconds,
-                lookback_seconds=delivery_check_lookback_seconds,
             )
+            if delivery_status.status == "confirmed_in_bluebubbles":
+                history.setdefault("messages", []).append(
+                    {
+                        "phone": recipient,
+                        "timestamp": str(time.time()),
+                        "message": message,
+                    }
+                )
+                _save_history(state_file, history)
+
+            result_detail = delivery_status.detail
+            result_error = delivery_status.error
+            transport_status = "sent"
+            raw_error = delivery_status.raw_error
+            if send_context.transport_error:
+                if delivery_status.status == "confirmed_in_bluebubbles":
+                    result_detail = (
+                        f"{delivery_status.detail} "
+                        f"发送接口曾返回异常，但消息已确认发出：{send_context.transport_error}"
+                    )
+                    transport_status = "sent_with_api_error"
+                else:
+                    transport_status = "api_error"
+                    result_error = send_context.transport_error
+                    raw_error = send_context.transport_error
+
             results.append(
                 SendResult(
                     phone=recipient,
                     status=delivery_status.status,
-                    detail=delivery_status.detail,
-                    error=delivery_status.error,
+                    detail=result_detail,
+                    error=result_error,
                 )
             )
             _append_batch_event(
@@ -999,20 +649,21 @@ def send_imessages_with_risk_control(
                     "recipient": recipient,
                     "message": message,
                     "delivery_status": delivery_status.status,
-                    "detail": delivery_status.detail,
-                    "error": delivery_status.error,
+                    "detail": result_detail,
+                    "error": result_error,
+                    "transport_error": send_context.transport_error,
                 },
             )
             _upsert_batch_record(
                 batch_records_by_key,
                 recipient=recipient,
                 message=message,
-                transport_status="sent",
+                transport_status=transport_status,
                 delivery_status=delivery_status.status,
-                detail=delivery_status.detail,
+                detail=result_detail,
                 attempted_at=attempted_at,
-                error=delivery_status.error,
-                raw_error=delivery_status.raw_error,
+                error=result_error,
+                raw_error=raw_error,
             )
             _save_batch_results(
                 batch_results_path,
@@ -1054,12 +705,5 @@ def send_imessages_with_risk_control(
                 batch_date=batch_date,
                 batch_records_by_key=batch_records_by_key,
             )
-
-        if index < len(queued_recipients) - 1 and sent_in_this_run < send_budget:
-            delay_seconds = random.randint(
-                rules.min_delay_between_messages_seconds,
-                rules.max_delay_between_messages_seconds,
-            )
-            time.sleep(delay_seconds)
 
     return results
