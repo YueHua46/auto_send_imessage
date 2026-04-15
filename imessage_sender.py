@@ -465,20 +465,27 @@ tell application "Messages" to activate
 
 tell application "System Events"
     tell process "Messages"
-        -- 1. 按下 Command + N 开启新窗口
+        -- 1. 开启新窗口
         keystroke "n" using command down
-        delay 1
+        delay 1.5
         
-        -- 2. 输入手机号并确认
+        -- 2. 模拟真人输入：逐字输入或输入后多等一会儿
         keystroke targetPhone
-        delay 0.5
-        key code 36 -- 按下 Enter (Return)
+        delay 1.5 -- 增加等待，让系统把号码识别为“气泡”
+        
+        -- 3. 尝试切换焦点
+        -- 技巧：先按一次 Tab 往往比直接按 Enter 更能强制 UI 刷新焦点
+        key code 48 -- Tab
         delay 1
         
-        -- 3. 输入消息内容并发送
+        -- 如果 Tab 没跳过去，再补一个 Enter
+        key code 36 -- Enter
+        delay 1
+        
+        -- 4. 输入消息并发送
         keystroke messageText
-        delay 0.5
-        key code 36 -- 按下 Enter (Return)
+        delay 1
+        key code 36 -- 发送
     end tell
 end tell
 '''
