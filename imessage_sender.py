@@ -16,6 +16,36 @@ from typing import Any
 class IMessageSendError(RuntimeError):
     """当iMessage发送失败时抛出该异常"""
 
+def _escape_applescript_string(value: str) -> str:
+    """对AppleScript字符串进行转义"""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+def _add_to_contacts_script(phone: str, name: str = "iMessage Customer") -> str:
+    """构造 AppleScript 将手机号添加到通讯录，以提高 iMessage 发送成功率"""
+    escaped_phone = _escape_applescript_string(phone)
+    escaped_name = _escape_applescript_string(name)
+    return f'''
+tell application "Contacts"
+    set existingPeople to (every person whose value of phones contains "{escaped_phone}")
+    if (count of existingPeople) is 0 then
+        set newPerson to make new person with properties {{first name:"{escaped_name}", last name:""}}
+        make new phone at end of phones of newPerson with properties {{label:"mobile", value:"{escaped_phone}"}}
+        save
+    end if
+end tell
+'''
+
+def ensure_contact_exists(phone: str) -> bool:
+    """确保手机号在通讯录中存在"""
+    if sys.platform != "darwin":
+        return False
+    script = _add_to_contacts_script(phone)
+    try:
+        subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
+        return True
+    except Exception:
+        return False
+
 # 发送风控参数配置，控制延迟、批次、每日上限等
 @dataclass(slots=True)
 class IMessageRiskControl:
@@ -461,31 +491,32 @@ def _build_direct_send_script(phone: str, message: str) -> str:
 set targetPhone to "{escaped_phone}"
 set messageText to "{escaped_message}"
 
+-- 1. 将消息存入剪贴板，避免逐字输入导致的卡顿和丢包
+set the clipboard to messageText
+
 tell application "Messages" to activate
 
 tell application "System Events"
     tell process "Messages"
-        -- 1. 开启新窗口
+        -- 2. 开启新窗口
         keystroke "n" using command down
         delay 1.5
         
-        -- 2. 模拟真人输入：逐字输入或输入后多等一会儿
+        -- 3. 输入手机号
         keystroke targetPhone
-        delay 1.5 -- 增加等待，让系统把号码识别为“气泡”
-        
-        -- 3. 尝试切换焦点
-        -- 技巧：先按一次 Tab 往往比直接按 Enter 更能强制 UI 刷新焦点
-        key code 48 -- Tab
         delay 1
-        
-        -- 如果 Tab 没跳过去，再补一个 Enter
-        key code 36 -- Enter
+        key code 36 -- Enter 确认号码
         delay 1
+        key code 36 -- 再次 Enter 确保跳入消息框
+        delay 0.5
         
-        -- 4. 输入消息并发送
-        keystroke messageText
+        -- 4. 使用 Cmd+V 瞬间粘贴长文本
+        keystroke "v" using command down
+        delay 0.5
+        
+        -- 5. 发送
+        key code 36 -- Enter 发送
         delay 1
-        key code 36 -- 发送
     end tell
 end tell
 '''
@@ -620,6 +651,10 @@ def send_imessages_with_risk_control(
         )
 
         try:
+            # 1. 尝试将联系人添加到通讯录（绕过风控的关键尝试）
+            ensure_contact_exists(phone)
+            time.sleep(1)  # 给通讯录同步留一点点时间
+
             send_imessage_once(phone, message)
             sent_in_this_run += 1
             # 记录本次发送历史
