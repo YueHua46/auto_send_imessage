@@ -14,6 +14,12 @@ class AppConfig:
     order_export_out: str = "订单管理导出.xlsx"
     print_request_debug: bool = True
     imessage_text: str = "Hi"
+    imessage_llm_rewrite_enabled: bool = False
+    openai_base_url: str | None = None
+    openai_api_key: str | None = None
+    openai_model: str = "gemini-2.0-flash"
+    openai_timeout_seconds: int = 20
+    openai_temperature: float = 0.9
     imessage_send_enabled: bool = True
     imessage_dry_run: bool = False
     imessage_max_send_count: int | None = None

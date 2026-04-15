@@ -6,3 +6,4 @@ orjson
 pycryptodome
 requests
 dotenv
+openai

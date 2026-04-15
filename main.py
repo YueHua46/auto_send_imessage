@@ -99,6 +99,28 @@ def _get_optional_int_env(name: str) -> int | None:
         raise ValueError(f"{name} 必须是整数，当前值: {raw}") from exc
 
 
+def _get_optional_float_env(name: str) -> float | None:
+    raw = _get_optional_env(name)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是数字，当前值: {raw}") from exc
+
+
+def _get_optional_bool_env(name: str) -> bool | None:
+    raw = _get_optional_env(name)
+    if raw is None:
+        return None
+    normalized = raw.lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{name} 必须是布尔值（true/false），当前值: {raw}")
+
+
 def _parse_csv_values(raw: str) -> list[str]:
     normalized = raw.replace("，", ",").replace(";", ",").replace("\n", ",")
     return [item.strip() for item in normalized.split(",") if item.strip()]
@@ -177,6 +199,34 @@ def _load_runtime_app_config() -> Any:
         if timeout_override <= 0:
             raise ValueError("IMESSAGE_DELIVERY_CHECK_TIMEOUT_SECONDS 必须大于 0")
         overrides["imessage_delivery_check_timeout_seconds"] = timeout_override
+
+    llm_rewrite_enabled_override = _get_optional_bool_env("IMESSAGE_LLM_REWRITE_ENABLED")
+    if llm_rewrite_enabled_override is not None:
+        overrides["imessage_llm_rewrite_enabled"] = llm_rewrite_enabled_override
+
+    openai_base_url_override = _get_optional_env("OPENAI_BASE_URL")
+    if openai_base_url_override:
+        overrides["openai_base_url"] = openai_base_url_override
+
+    openai_api_key_override = _get_optional_env("OPENAI_API_KEY")
+    if openai_api_key_override:
+        overrides["openai_api_key"] = openai_api_key_override
+
+    openai_model_override = _get_optional_env("OPENAI_MODEL")
+    if openai_model_override:
+        overrides["openai_model"] = openai_model_override
+
+    openai_timeout_override = _get_optional_int_env("OPENAI_TIMEOUT_SECONDS")
+    if openai_timeout_override is not None:
+        if openai_timeout_override <= 0:
+            raise ValueError("OPENAI_TIMEOUT_SECONDS 必须大于 0")
+        overrides["openai_timeout_seconds"] = openai_timeout_override
+
+    openai_temperature_override = _get_optional_float_env("OPENAI_TEMPERATURE")
+    if openai_temperature_override is not None:
+        if not (0 <= openai_temperature_override <= 2):
+            raise ValueError("OPENAI_TEMPERATURE 必须在 0 到 2 之间")
+        overrides["openai_temperature"] = openai_temperature_override
 
     if not overrides:
         return APP_CONFIG
@@ -537,6 +587,12 @@ def main() -> int:
             delivery_check_timeout_seconds=app_config.imessage_delivery_check_timeout_seconds,
             delivery_check_interval_seconds=app_config.imessage_delivery_check_interval_seconds,
             delivery_check_lookback_seconds=app_config.imessage_delivery_check_lookback_seconds,
+            llm_rewrite_enabled=app_config.imessage_llm_rewrite_enabled,
+            openai_base_url=app_config.openai_base_url,
+            openai_api_key=app_config.openai_api_key,
+            openai_model=app_config.openai_model,
+            openai_timeout_seconds=app_config.openai_timeout_seconds,
+            openai_temperature=app_config.openai_temperature,
         )
         for result in send_results:
             if result.error:

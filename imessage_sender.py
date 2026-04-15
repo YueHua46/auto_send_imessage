@@ -12,6 +12,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+try:
+    from openai import OpenAI
+except Exception:  # pragma: no cover - 仅在未安装依赖时触发
+    OpenAI = None  # type: ignore[assignment]
+
 # 自定义异常，用于iMessage发送失败时抛出
 class IMessageSendError(RuntimeError):
     """当iMessage发送失败时抛出该异常"""
@@ -85,6 +90,54 @@ class DeliveryCheckResult:
 
 
 APPLE_EPOCH_UNIX_SECONDS = 978307200
+
+
+class IMessageLLMRewriter:
+    """基于 OpenAI 兼容接口对 iMessage 文案做语义一致改写。"""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout_seconds: int = 20,
+        temperature: float = 0.9,
+    ) -> None:
+        if OpenAI is None:
+            raise IMessageSendError("未安装 openai 依赖，请先安装 requirements.txt 中的新依赖。")
+        self._client = OpenAI(
+            api_key=api_key.strip(),
+            base_url=base_url.strip(),
+            timeout=max(timeout_seconds, 1),
+        )
+        self._model = model.strip()
+        self._temperature = max(0.0, min(temperature, 1.8))
+
+    def rewrite(self, original_text: str) -> str:
+        source = original_text.strip()
+        if not source:
+            return original_text
+        prompt = (
+            "你是 iMessage 文案优化助手。请改写下面的消息，要求：\n"
+            "1) 保持核心主题和意图不变，必须与原文契合；\n"
+            "2) 用词、语序、句式随机变化，避免重复模板感；\n"
+            "3) 保持自然、礼貌、可直接发送；\n"
+            "4) 禁止添加解释、标题、引号、编号、前后缀说明；\n"
+            "5) 尽量保持与原文接近的长度与段落结构。\n\n"
+            f"原文：\n{source}"
+        )
+        response = self._client.chat.completions.create(
+            model=self._model,
+            temperature=self._temperature,
+            messages=[
+                {"role": "system", "content": "你只输出可直接发送的最终消息正文。"},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        rewritten = (response.choices[0].message.content or "").strip()
+        rewritten = rewritten.strip().strip('"').strip("'").strip()
+        return rewritten or original_text
 
 
 def _now_iso() -> str:
@@ -555,6 +608,12 @@ def send_imessages_with_risk_control(
     delivery_check_timeout_seconds: int = 45,
     delivery_check_interval_seconds: int = 3,
     delivery_check_lookback_seconds: int = 600,
+    llm_rewrite_enabled: bool = False,
+    openai_base_url: str | None = None,
+    openai_api_key: str | None = None,
+    openai_model: str = "gemini-2.0-flash",
+    openai_timeout_seconds: int = 20,
+    openai_temperature: float = 0.9,
 ) -> list[SendResult]:
     # 采用传入的风控规则，否则用默认
     rules = rules or IMessageRiskControl()
@@ -590,6 +649,18 @@ def send_imessages_with_risk_control(
     if max_send_count is not None:
         send_budget = min(send_budget, max_send_count)
 
+    rewriter: IMessageLLMRewriter | None = None
+    if llm_rewrite_enabled:
+        if not openai_base_url or not openai_api_key:
+            raise IMessageSendError("已启用 LLM 改写，但 OPENAI_BASE_URL 或 OPENAI_API_KEY 未配置。")
+        rewriter = IMessageLLMRewriter(
+            base_url=openai_base_url,
+            api_key=openai_api_key,
+            model=openai_model,
+            timeout_seconds=openai_timeout_seconds,
+            temperature=openai_temperature,
+        )
+
     # 排除正在冷却期手机号，及本批次已送达的手机号（同一消息文本）
     queued_phones = [phone for phone in unique_phones if phone not in cooling_down_phones]
     skip_statuses_in_batch = {"delivered", "sent_not_confirmed"}
@@ -597,7 +668,10 @@ def send_imessages_with_risk_control(
         str(record.get("recipient", "")).strip()
         for record in batch_records_by_key.values()
         if str(record.get("delivery_status", "")) in skip_statuses_in_batch
-        and str(record.get("message", "")) == message
+        and (
+            rewriter is not None
+            or str(record.get("message", "")) == message
+        )
     }
 
     results: list[SendResult] = []
@@ -619,10 +693,17 @@ def send_imessages_with_risk_control(
 
     # dry_run模式，仅输出将会被发送的手机号和内容，不实际执行
     if dry_run:
-        dry_run_results = [
-            SendResult(phone=phone, status="dry_run", detail=f'将会发送 "{message}"')
-            for phone in queued_phones[:send_budget]
-        ]
+        dry_run_results: list[SendResult] = []
+        for phone in queued_phones[:send_budget]:
+            message_to_send = message
+            if rewriter is not None:
+                try:
+                    message_to_send = rewriter.rewrite(message)
+                except Exception:
+                    message_to_send = message
+            dry_run_results.append(
+                SendResult(phone=phone, status="dry_run", detail=f'将会发送 "{message_to_send}"')
+            )
         return results + dry_run_results
 
     # 启动初期随机等待，进一步防止批量行为
@@ -640,12 +721,27 @@ def send_imessages_with_risk_control(
             time.sleep(batch_pause)
 
         attempted_at = _now_iso()
+        message_to_send = message
+        if rewriter is not None:
+            try:
+                message_to_send = rewriter.rewrite(message)
+            except Exception as rewrite_exc:
+                _append_batch_event(
+                    batch_events_path,
+                    {
+                        "event_type": "llm_rewrite_failed",
+                        "recipient": phone,
+                        "message": message,
+                        "detail": f"LLM改写失败，回退原文：{rewrite_exc}",
+                    },
+                )
+                message_to_send = message
         _append_batch_event(
             batch_events_path,
             {
                 "event_type": "send_attempt",
                 "recipient": phone,
-                "message": message,
+                "message": message_to_send,
                 "attempted_at": attempted_at,
             },
         )
@@ -655,20 +751,20 @@ def send_imessages_with_risk_control(
             ensure_contact_exists(phone)
             time.sleep(1)  # 给通讯录同步留一点点时间
 
-            send_imessage_once(phone, message)
+            send_imessage_once(phone, message_to_send)
             sent_in_this_run += 1
             # 记录本次发送历史
             history.setdefault("messages", []).append(
                 {
                     "phone": phone,
                     "timestamp": str(time.time()),
-                    "message": message,
+                    "message": message_to_send,
                 }
             )
             _save_history(state_file, history)
             delivery_status = _poll_delivery_status(
                 phone,
-                message,
+                message_to_send,
                 timeout_seconds=delivery_check_timeout_seconds,
                 interval_seconds=delivery_check_interval_seconds,
                 lookback_seconds=delivery_check_lookback_seconds,
@@ -686,7 +782,7 @@ def send_imessages_with_risk_control(
                 {
                     "event_type": "delivery_status",
                     "recipient": phone,
-                    "message": message,
+                    "message": message_to_send,
                     "delivery_status": delivery_status.status,
                     "detail": delivery_status.detail,
                     "error": delivery_status.error,
@@ -695,7 +791,7 @@ def send_imessages_with_risk_control(
             _upsert_batch_record(
                 batch_records_by_key,
                 recipient=phone,
-                message=message,
+                message=message_to_send,
                 transport_status="sent",
                 delivery_status=delivery_status.status,
                 detail=delivery_status.detail,
@@ -723,14 +819,14 @@ def send_imessages_with_risk_control(
                 {
                     "event_type": "send_failed",
                     "recipient": phone,
-                    "message": message,
+                    "message": message_to_send,
                     "detail": error_detail,
                 },
             )
             _upsert_batch_record(
                 batch_records_by_key,
                 recipient=phone,
-                message=message,
+                message=message_to_send,
                 transport_status="failed",
                 delivery_status="failed",
                 detail=error_detail,
