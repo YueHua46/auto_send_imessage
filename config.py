@@ -14,7 +14,7 @@ class AppConfig:
     order_export_out: str = "订单管理导出.xlsx"
     print_request_debug: bool = True
     imessage_text: str = "Hi"
-    imessage_send_enabled: bool = False
+    imessage_send_enabled: bool = True
     imessage_dry_run: bool = False
     imessage_max_send_count: int | None = None
     imessage_state_path: str = ".领星待审核待发货iMessage发送历史.json"
