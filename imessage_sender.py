@@ -461,12 +461,25 @@ def _build_direct_send_script(phone: str, message: str) -> str:
 set targetPhone to "{escaped_phone}"
 set messageText to "{escaped_message}"
 
-tell application "Messages"
-    activate
-    delay 2
-    set targetService to first service whose service type = iMessage
-    set targetParticipant to participant targetPhone of targetService
-    send messageText to targetParticipant
+tell application "Messages" to activate
+
+tell application "System Events"
+    tell process "Messages"
+        -- 1. 按下 Command + N 开启新窗口
+        keystroke "n" using command down
+        delay 1
+        
+        -- 2. 输入手机号并确认
+        keystroke targetPhone
+        delay 0.5
+        key code 36 -- 按下 Enter (Return)
+        delay 1
+        
+        -- 3. 输入消息内容并发送
+        keystroke messageText
+        delay 0.5
+        key code 36 -- 按下 Enter (Return)
+    end tell
 end tell
 '''
 
