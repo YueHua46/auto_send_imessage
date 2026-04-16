@@ -28,6 +28,10 @@ class AppConfig:
     imessage_delivery_check_timeout_seconds: int = 90
     imessage_delivery_check_interval_seconds: int = 3
     imessage_delivery_check_lookback_seconds: int = 600
+    bluebubbles_base_url: str | None = None
+    bluebubbles_password: str | None = None
+    bluebubbles_auth_param_name: str = "guid"
+    bluebubbles_verify_ssl: bool = True
     imessage_risk_control: IMessageRiskControl = field(default_factory=IMessageRiskControl)
 
 

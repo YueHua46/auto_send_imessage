@@ -228,6 +228,22 @@ def _load_runtime_app_config() -> Any:
             raise ValueError("OPENAI_TEMPERATURE 必须在 0 到 2 之间")
         overrides["openai_temperature"] = openai_temperature_override
 
+    bluebubbles_base_url = _get_optional_env("BLUEBUBBLES_BASE_URL")
+    if bluebubbles_base_url:
+        overrides["bluebubbles_base_url"] = bluebubbles_base_url
+
+    bluebubbles_password = _get_optional_env("BLUEBUBBLES_PASSWORD")
+    if bluebubbles_password:
+        overrides["bluebubbles_password"] = bluebubbles_password
+
+    bluebubbles_auth_param_name = _get_optional_env("BLUEBUBBLES_AUTH_PARAM_NAME")
+    if bluebubbles_auth_param_name:
+        overrides["bluebubbles_auth_param_name"] = bluebubbles_auth_param_name
+
+    bluebubbles_verify_ssl = _get_optional_bool_env("BLUEBUBBLES_VERIFY_SSL")
+    if bluebubbles_verify_ssl is not None:
+        overrides["bluebubbles_verify_ssl"] = bluebubbles_verify_ssl
+
     if not overrides:
         return APP_CONFIG
     return replace(APP_CONFIG, **overrides)
@@ -593,6 +609,10 @@ def main() -> int:
             openai_model=app_config.openai_model,
             openai_timeout_seconds=app_config.openai_timeout_seconds,
             openai_temperature=app_config.openai_temperature,
+            bluebubbles_base_url=app_config.bluebubbles_base_url,
+            bluebubbles_password=app_config.bluebubbles_password,
+            bluebubbles_auth_param_name=app_config.bluebubbles_auth_param_name,
+            bluebubbles_verify_ssl=app_config.bluebubbles_verify_ssl,
         )
         for result in send_results:
             if result.error:
