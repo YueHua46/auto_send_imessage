@@ -109,7 +109,17 @@ def create_app_handler(app_config: AppConfig) -> type[BaseHTTPRequestHandler]:
         def _handle_send(self, *, is_batch: bool) -> None:
             try:
                 payload = _parse_json_body(self)
+                send_mode = str(payload.get("send_mode", "") or "").strip().lower()
+                if not send_mode:
+                    send_mode = app_config.imessage_default_mode
+                if send_mode not in {"image", "text"}:
+                    raise ValueError("`send_mode` 仅支持 image 或 text")
+
                 message = str(payload.get("message", "") or "").strip() or app_config.imessage_text
+                image_path = (
+                    str(payload.get("image_path", "") or "").strip()
+                    or app_config.imessage_default_image_path
+                )
                 batch_date = str(payload.get("batch_date", "") or "").strip() or None
                 if is_batch:
                     recipients = payload.get("recipients")
@@ -128,6 +138,8 @@ def create_app_handler(app_config: AppConfig) -> type[BaseHTTPRequestHandler]:
                 results = send_imessages(
                     prepared,
                     message=message,
+                    send_mode=send_mode,
+                    image_path=image_path,
                     batch_date=batch_date,
                     **runtime_options,
                 )
@@ -151,7 +163,9 @@ def create_app_handler(app_config: AppConfig) -> type[BaseHTTPRequestHandler]:
                 HTTPStatus.OK,
                 {
                     "ok": True,
+                    "send_mode": send_mode,
                     "message": message,
+                    "image_path": image_path if send_mode == "image" else "",
                     "count": len(results),
                     "results": [asdict(item) for item in results],
                 },

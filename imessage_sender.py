@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import time
 import uuid
 from dataclasses import dataclass
@@ -46,9 +47,10 @@ class DeliveryCheckResult:
 @dataclass(slots=True)
 class BlueBubblesSendContext:
     recipient: str
-    message: str
+    content_id: str
     attempted_at_ms: int
     temp_guid: str
+    send_mode: str = "text"
     message_guid: str | None = None
     transport_error: str | None = None
 
@@ -57,8 +59,8 @@ def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def _batch_record_key(recipient: str, message: str) -> str:
-    return f"{recipient}\n{message}"
+def _batch_record_key(recipient: str, content_id: str) -> str:
+    return f"{recipient}\n{content_id}"
 
 
 def _resolve_batch_paths(
@@ -125,10 +127,13 @@ def _index_batch_records(records: list[dict[str, Any]]) -> dict[str, dict[str, A
     indexed: dict[str, dict[str, Any]] = {}
     for record in records:
         recipient = str(record.get("recipient", "")).strip()
-        message = str(record.get("message", ""))
+        content_id = str(record.get("content_id", "")).strip()
+        if not content_id:
+            message = str(record.get("message", ""))
+            content_id = f"text::{message}"
         if not recipient:
             continue
-        indexed[_batch_record_key(recipient, message)] = record
+        indexed[_batch_record_key(recipient, content_id)] = record
     return indexed
 
 
@@ -136,7 +141,10 @@ def _upsert_batch_record(
     batch_records_by_key: dict[str, dict[str, Any]],
     *,
     recipient: str,
+    content_id: str,
+    send_mode: str,
     message: str,
+    image_path: str,
     transport_status: str,
     delivery_status: str,
     detail: str,
@@ -144,12 +152,15 @@ def _upsert_batch_record(
     error: str | None = None,
     raw_error: str | None = None,
 ) -> None:
-    key = _batch_record_key(recipient, message)
+    key = _batch_record_key(recipient, content_id)
     existing = batch_records_by_key.get(key, {})
     previous_attempt_count = int(existing.get("attempt_count", 0) or 0)
     batch_records_by_key[key] = {
         "recipient": recipient,
+        "content_id": content_id,
+        "send_mode": send_mode,
         "message": message,
+        "image_path": image_path,
         "transport_status": transport_status,
         "delivery_status": delivery_status,
         "detail": detail,
@@ -293,6 +304,64 @@ def _request_json(
     return payload
 
 
+def _request_multipart_json(
+    *,
+    path: str,
+    api_config: BlueBubblesAPIConfig,
+    timeout_seconds: int,
+    data: dict[str, Any] | None = None,
+    files: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not api_config.password.strip():
+        raise IMessageSendError("缺少 BLUEBUBBLES_PASSWORD，无法调用 BlueBubbles API。")
+
+    url = f"{_normalize_base_url(api_config.base_url)}{path}"
+    session = requests.Session()
+    hostname = (urlparse(url).hostname or "").strip().lower()
+    if hostname in {"127.0.0.1", "localhost", "::1"}:
+        session.trust_env = False
+    try:
+        response = session.post(
+            url=url,
+            params=_auth_params(api_config),
+            data=data,
+            files=files,
+            timeout=max(timeout_seconds, 1),
+            verify=api_config.verify_ssl,
+        )
+    except requests.RequestException as exc:
+        raise IMessageSendError(f"请求 BlueBubbles 失败：{exc}") from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise IMessageSendError(
+            f"BlueBubbles 返回了非 JSON 响应（HTTP {response.status_code}）。"
+        ) from exc
+
+    status = _coerce_int(payload.get("status"))
+    message = str(payload.get("message", "") or "").strip()
+    if response.status_code >= 400 or status is None or status >= 400:
+        error_payload = payload.get("error")
+        error_text = ""
+        if isinstance(error_payload, dict):
+            error_text = str(error_payload.get("error", "") or error_payload.get("type", "")).strip()
+        detail = error_text or message or f"HTTP {response.status_code}"
+        raise IMessageSendError(f"BlueBubbles API 调用失败：{detail}")
+    return payload
+
+
+def _guess_mime_type(file_path: Path) -> str:
+    guessed, _ = mimetypes.guess_type(file_path.name)
+    return guessed or "application/octet-stream"
+
+
+def _build_content_id(*, send_mode: str, message: str, image_path: str) -> str:
+    if send_mode == "text":
+        return f"text::{message}"
+    return f"image::{image_path}"
+
+
 def _read_recent_log_lines(log_path: Path, *, limit: int = 300) -> list[str]:
     if not log_path.exists():
         return []
@@ -377,11 +446,11 @@ def _find_matching_sent_message(
     messages: list[dict[str, Any]],
     *,
     recipient: str,
-    expected_text: str,
+    expected_text: str | None,
     attempted_after_ms: int,
     expected_guid: str | None,
 ) -> dict[str, Any] | None:
-    expected_normalized = _normalize_message_text(expected_text)
+    expected_normalized = _normalize_message_text(expected_text or "")
     for item in messages:
         if not isinstance(item, dict):
             continue
@@ -400,15 +469,18 @@ def _find_matching_sent_message(
         if address and not _recipient_matches(address, recipient):
             continue
 
-        candidate_text = _normalize_message_text(str(item.get("text", "") or ""))
-        if candidate_text == expected_normalized:
+        if expected_normalized:
+            candidate_text = _normalize_message_text(str(item.get("text", "") or ""))
+            if candidate_text == expected_normalized:
+                return item
+        else:
             return item
     return None
 
 
 def _confirm_delivery_status(
     recipient: str,
-    message: str,
+    message: str | None,
     *,
     send_context: BlueBubblesSendContext,
     api_config: BlueBubblesAPIConfig,
@@ -478,6 +550,8 @@ def send_imessage_once(
     phone: str,
     message: str,
     *,
+    send_mode: str = "text",
+    image_path: str = "",
     api_config: BlueBubblesAPIConfig | None = None,
 ) -> BlueBubblesSendContext:
     config = api_config or BlueBubblesAPIConfig()
@@ -485,18 +559,45 @@ def send_imessage_once(
     temp_guid = f"temp-{uuid.uuid4()}"
     message_guid: str | None = None
     transport_error: str | None = None
+    content_id = _build_content_id(send_mode=send_mode, message=message, image_path=image_path)
     try:
-        payload = _request_json(
-            method="POST",
-            path="/api/v1/message/text",
-            api_config=config,
-            timeout_seconds=max(config.send_timeout_seconds, 1),
-            json_body={
-                "chatGuid": _build_chat_guid(phone),
-                "tempGuid": temp_guid,
-                "message": message,
-            },
-        )
+        if send_mode == "image":
+            image_file = Path(image_path).expanduser()
+            if not image_file.is_absolute():
+                image_file = (Path.cwd() / image_file).resolve()
+            if not image_file.exists() or not image_file.is_file():
+                raise IMessageSendError(f"图片文件不存在：{image_file}")
+            with image_file.open("rb") as file_handle:
+                payload = _request_multipart_json(
+                    path="/api/v1/message/attachment",
+                    api_config=config,
+                    timeout_seconds=max(config.send_timeout_seconds, 1),
+                    data={
+                        "chatGuid": _build_chat_guid(phone),
+                        "tempGuid": temp_guid,
+                        "name": image_file.name,
+                        "method": "private-api",
+                    },
+                    files={
+                        "attachment": (
+                            image_file.name,
+                            file_handle,
+                            _guess_mime_type(image_file),
+                        )
+                    },
+                )
+        else:
+            payload = _request_json(
+                method="POST",
+                path="/api/v1/message/text",
+                api_config=config,
+                timeout_seconds=max(config.send_timeout_seconds, 1),
+                json_body={
+                    "chatGuid": _build_chat_guid(phone),
+                    "tempGuid": temp_guid,
+                    "message": message,
+                },
+            )
         data = payload.get("data")
         if isinstance(data, dict):
             raw_guid = str(data.get("guid", "") or "").strip()
@@ -507,9 +608,10 @@ def send_imessage_once(
 
     return BlueBubblesSendContext(
         recipient=phone,
-        message=message,
+        content_id=content_id,
         attempted_at_ms=attempted_at_ms,
         temp_guid=temp_guid,
+        send_mode=send_mode,
         message_guid=message_guid,
         transport_error=transport_error,
     )
@@ -519,6 +621,8 @@ def send_imessages(
     phones: list[str],
     message: str = "Hi",
     *,
+    send_mode: str = "text",
+    image_path: str = "img/send_msg.png",
     state_path: str | Path = ".imessage_send_history.json",
     normalize_phone_numbers: bool = True,
     batch_root_dir: str | Path = "imessage_batches",
@@ -527,6 +631,24 @@ def send_imessages(
     delivery_check_timeout_seconds: int = 45,
     delivery_check_interval_seconds: int = 3,
 ) -> list[SendResult]:
+    normalized_mode = (send_mode or "").strip().lower() or "image"
+    if normalized_mode not in {"image", "text"}:
+        raise ValueError("send_mode 仅支持 image 或 text")
+    if normalized_mode == "text":
+        prepared_message = message
+        if not prepared_message.strip():
+            raise ValueError("文本模式下 message 不能为空")
+        prepared_image_path = ""
+    else:
+        prepared_message = message
+        prepared_image_path = (image_path or "").strip() or "img/send_msg.png"
+
+    content_id = _build_content_id(
+        send_mode=normalized_mode,
+        message=prepared_message,
+        image_path=prepared_image_path,
+    )
+
     api_config = api_config or BlueBubblesAPIConfig()
     unique_recipients = _prepare_unique_recipients(
         phones,
@@ -552,7 +674,13 @@ def send_imessages(
         _recipient_identity_key(str(record.get("recipient", "")).strip())
         for record in batch_records_by_key.values()
         if str(record.get("delivery_status", "")) in skip_statuses_in_batch
-        and str(record.get("message", "")) == message
+        and (
+            str(record.get("content_id", "")).strip() == content_id
+            or (
+                not str(record.get("content_id", "")).strip()
+                and str(record.get("message", "")) == prepared_message
+            )
+        )
     }
 
     results: list[SendResult] = []
@@ -565,7 +693,10 @@ def send_imessages(
                 {
                     "event_type": "skip_processed",
                     "recipient": recipient,
-                    "message": message,
+                    "content_id": content_id,
+                    "send_mode": normalized_mode,
+                    "message": prepared_message,
+                    "image_path": prepared_image_path,
                     "detail": detail,
                 },
             )
@@ -588,7 +719,10 @@ def send_imessages(
             {
                 "event_type": "send_attempt",
                 "recipient": recipient,
-                "message": message,
+                    "content_id": content_id,
+                    "send_mode": normalized_mode,
+                    "message": prepared_message,
+                    "image_path": prepared_image_path,
                 "attempted_at": attempted_at,
             },
         )
@@ -596,13 +730,15 @@ def send_imessages(
         try:
             send_context = send_imessage_once(
                 recipient,
-                message,
+                prepared_message,
+                send_mode=normalized_mode,
+                image_path=prepared_image_path,
                 api_config=api_config,
             )
 
             delivery_status = _confirm_delivery_status(
                 recipient,
-                message,
+                prepared_message if normalized_mode == "text" else None,
                 send_context=send_context,
                 api_config=api_config,
                 timeout_seconds=delivery_check_timeout_seconds,
@@ -613,7 +749,9 @@ def send_imessages(
                     {
                         "phone": recipient,
                         "timestamp": str(time.time()),
-                        "message": message,
+                            "message": prepared_message,
+                            "send_mode": normalized_mode,
+                            "image_path": prepared_image_path,
                     }
                 )
                 _save_history(state_file, history)
@@ -647,7 +785,10 @@ def send_imessages(
                 {
                     "event_type": "delivery_status",
                     "recipient": recipient,
-                    "message": message,
+                    "content_id": content_id,
+                    "send_mode": normalized_mode,
+                    "message": prepared_message,
+                    "image_path": prepared_image_path,
                     "delivery_status": delivery_status.status,
                     "detail": result_detail,
                     "error": result_error,
@@ -657,7 +798,10 @@ def send_imessages(
             _upsert_batch_record(
                 batch_records_by_key,
                 recipient=recipient,
-                message=message,
+                content_id=content_id,
+                send_mode=normalized_mode,
+                message=prepared_message,
+                image_path=prepared_image_path,
                 transport_status=transport_status,
                 delivery_status=delivery_status.status,
                 detail=result_detail,
@@ -685,14 +829,20 @@ def send_imessages(
                 {
                     "event_type": "send_failed",
                     "recipient": recipient,
-                    "message": message,
+                    "content_id": content_id,
+                    "send_mode": normalized_mode,
+                    "message": prepared_message,
+                    "image_path": prepared_image_path,
                     "detail": error_detail,
                 },
             )
             _upsert_batch_record(
                 batch_records_by_key,
                 recipient=recipient,
-                message=message,
+                content_id=content_id,
+                send_mode=normalized_mode,
+                message=prepared_message,
+                image_path=prepared_image_path,
                 transport_status="failed",
                 delivery_status="failed",
                 detail=error_detail,

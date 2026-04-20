@@ -19,7 +19,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
     send_parser = subparsers.add_parser("send", help="发送单条 iMessage")
     send_parser.add_argument("--recipient", required=True, help="目标号码或 iMessage 标识")
-    send_parser.add_argument("--message", default="", help="发送文案；未提供时使用 IMESSAGE_TEXT")
+    send_parser.add_argument("--message", default="", help="发送文案；仅在文本模式下生效")
+    send_parser.add_argument(
+        "--mode",
+        default="",
+        choices=("image", "text"),
+        help="发送模式：image(默认) 或 text",
+    )
+    send_parser.add_argument(
+        "--image-path",
+        default="",
+        help="图片发送路径；未提供时使用 IMESSAGE_DEFAULT_IMAGE_PATH",
+    )
     send_parser.add_argument("--batch-date", default="", help="可选：指定批次目录日期（YYYY-MM-DD）")
 
     serve_parser = subparsers.add_parser("serve", help="启动本地 HTTP 服务")
@@ -102,6 +113,17 @@ def _load_runtime_app_config() -> Any:
     if imessage_text_override:
         overrides["imessage_text"] = imessage_text_override.replace("\\n", "\n")
 
+    imessage_default_mode_override = _get_optional_env("IMESSAGE_DEFAULT_MODE")
+    if imessage_default_mode_override:
+        mode = imessage_default_mode_override.strip().lower()
+        if mode not in {"image", "text"}:
+            raise ValueError("IMESSAGE_DEFAULT_MODE 仅支持 image 或 text")
+        overrides["imessage_default_mode"] = mode
+
+    imessage_default_image_path_override = _get_optional_env("IMESSAGE_DEFAULT_IMAGE_PATH")
+    if imessage_default_image_path_override:
+        overrides["imessage_default_image_path"] = imessage_default_image_path_override
+
     timeout_override = _get_optional_int_env("IMESSAGE_DELIVERY_CHECK_TIMEOUT_SECONDS")
     if timeout_override is not None:
         if timeout_override <= 0:
@@ -128,11 +150,17 @@ def _load_runtime_app_config() -> Any:
 
 
 def _run_send_command(args: argparse.Namespace, app_config: Any) -> int:
+    mode = (args.mode.strip().lower() if args.mode else "") or app_config.imessage_default_mode
+    if mode not in {"image", "text"}:
+        raise ValueError("发送模式仅支持 image 或 text")
     message = args.message.strip() or app_config.imessage_text
+    image_path = args.image_path.strip() or app_config.imessage_default_image_path
     batch_date = args.batch_date.strip() or None
     results = send_imessages(
         [args.recipient.strip()],
         message=message,
+        send_mode=mode,
+        image_path=image_path,
         state_path=app_config.imessage_state_path,
         normalize_phone_numbers=False,
         batch_root_dir=app_config.imessage_batch_root_dir,
