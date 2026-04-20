@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 try:
     from openai import OpenAI
@@ -87,6 +87,13 @@ class DeliveryCheckResult:
     detail: str
     error: str | None = None
     raw_error: str | None = None
+
+
+@dataclass(slots=True)
+class IMessageSendPayload:
+    recipient: str
+    send_mode: Literal["text", "image"] = "image"
+    message: str | None = None
 
 
 APPLE_EPOCH_UNIX_SECONDS = 978307200
@@ -592,6 +599,123 @@ def send_imessage_once(phone: str, message: str) -> None:
         # 返回AppleScript错误信息
         stderr = (completed.stderr or completed.stdout or "").strip()
         raise IMessageSendError(stderr or f"osascript 非零退出码: {completed.returncode}")
+
+
+def _build_direct_send_image_script(phone: str, image_path: str | Path) -> str:
+    escaped_phone = _escape_applescript_string(phone)
+    resolved_image_path = str(Path(image_path).expanduser().resolve())
+    escaped_image_path = _escape_applescript_string(resolved_image_path)
+    image_suffix = Path(resolved_image_path).suffix.lower()
+    # AppleScript read 二进制图片时需要显式指定图片类型
+    if image_suffix == ".png":
+        clipboard_statement = 'set the clipboard to (read imageAlias as «class PNGf»)'
+    elif image_suffix in {".jpg", ".jpeg"}:
+        clipboard_statement = "set the clipboard to (read imageAlias as JPEG picture)"
+    else:
+        raise IMessageSendError("仅支持 png / jpg / jpeg 图片发送。")
+
+    return f'''
+set targetPhone to "{escaped_phone}"
+set imagePath to "{escaped_image_path}"
+set imageAlias to (POSIX file imagePath) as alias
+
+{clipboard_statement}
+
+tell application "Messages" to activate
+
+tell application "System Events"
+    tell process "Messages"
+        keystroke "n" using command down
+        delay 1.5
+
+        keystroke targetPhone
+        delay 1
+        key code 36
+        delay 1
+        key code 36
+        delay 0.6
+
+        keystroke "v" using command down
+        delay 0.6
+
+        key code 36
+        delay 1
+    end tell
+end tell
+'''
+
+
+def send_imessage_image_once(phone: str, image_path: str | Path) -> None:
+    if sys.platform != "darwin":
+        raise IMessageSendError("仅支持在macOS下由本地脚本自动发送iMessage。")
+    if shutil.which("osascript") is None:
+        raise IMessageSendError("本机未找到 osascript，无法自动发送iMessage。")
+    resolved = Path(image_path).expanduser().resolve()
+    if not resolved.exists():
+        raise IMessageSendError(f"图片文件不存在：{resolved}")
+    script = _build_direct_send_image_script(phone, resolved)
+    completed = subprocess.run(
+        ["osascript", "-e", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        raise IMessageSendError(stderr or f"osascript 非零退出码: {completed.returncode}")
+
+
+def parse_imessage_payload(payload: dict[str, Any]) -> IMessageSendPayload:
+    recipient = str(payload.get("recipient", "")).strip()
+    if not recipient:
+        raise IMessageSendError("payload 缺少 recipient。")
+
+    raw_send_mode = str(payload.get("send_mode", "image")).strip().lower() or "image"
+    if raw_send_mode not in {"text", "image"}:
+        raise IMessageSendError("send_mode 仅支持 text 或 image。")
+    send_mode = cast(Literal["text", "image"], raw_send_mode)
+
+    message_raw = payload.get("message")
+    message = None if message_raw is None else str(message_raw)
+    if send_mode == "text" and not (message or "").strip():
+        raise IMessageSendError("send_mode=text 时，message 不能为空。")
+
+    return IMessageSendPayload(
+        recipient=recipient,
+        send_mode=send_mode,
+        message=message.strip() if isinstance(message, str) else None,
+    )
+
+
+def send_imessage_by_payload(
+    payload: dict[str, Any],
+    *,
+    default_image_path: str | Path = "img/send_msg.png",
+) -> SendResult:
+    parsed = parse_imessage_payload(payload)
+    try:
+        ensure_contact_exists(parsed.recipient)
+        time.sleep(1)
+        if parsed.send_mode == "text":
+            send_imessage_once(parsed.recipient, parsed.message or "")
+            return SendResult(
+                phone=parsed.recipient,
+                status="sent",
+                detail="文本消息发送完成。",
+            )
+        send_imessage_image_once(parsed.recipient, default_image_path)
+        return SendResult(
+            phone=parsed.recipient,
+            status="sent",
+            detail=f"图片消息发送完成（{Path(default_image_path)}）。",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return SendResult(
+            phone=parsed.recipient,
+            status="failed",
+            detail=str(exc),
+            error=str(exc),
+        )
 
 # 带有防刷风控的iMessage批量发送主流程
 def send_imessages_with_risk_control(

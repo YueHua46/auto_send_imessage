@@ -194,6 +194,10 @@ def _load_runtime_app_config() -> Any:
         # 支持在 .env 中用 \n 表示换行
         overrides["imessage_text"] = imessage_text_override.replace("\\n", "\n")
 
+    imessage_default_image_path_override = _get_optional_env("IMESSAGE_DEFAULT_IMAGE_PATH")
+    if imessage_default_image_path_override:
+        overrides["imessage_default_image_path"] = imessage_default_image_path_override
+
     timeout_override = _get_optional_int_env("IMESSAGE_DELIVERY_CHECK_TIMEOUT_SECONDS")
     if timeout_override is not None:
         if timeout_override <= 0:
