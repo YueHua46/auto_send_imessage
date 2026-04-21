@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from imessage_sender import IMessageRiskControl
 
@@ -14,6 +15,7 @@ class AppConfig:
     order_export_out: str = "订单管理导出.xlsx"
     print_request_debug: bool = True
     imessage_text: str = "Hi"
+    imessage_send_mode: Literal["text", "image"] = "image"
     imessage_default_image_path: str = "img/send_msg.png"
     imessage_llm_rewrite_enabled: bool = False
     openai_base_url: str | None = None

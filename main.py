@@ -198,6 +198,16 @@ def _load_runtime_app_config() -> Any:
     if imessage_default_image_path_override:
         overrides["imessage_default_image_path"] = imessage_default_image_path_override
 
+    imessage_send_mode_raw = _get_optional_env("IMESSAGE_SEND_MODE")
+    if imessage_send_mode_raw:
+        normalized_mode = imessage_send_mode_raw.strip().lower()
+        if normalized_mode not in {"text", "image"}:
+            raise ValueError(
+                "IMESSAGE_SEND_MODE 仅支持 text 或 image，"
+                f"当前值: {imessage_send_mode_raw!r}"
+            )
+        overrides["imessage_send_mode"] = normalized_mode
+
     timeout_override = _get_optional_int_env("IMESSAGE_DELIVERY_CHECK_TIMEOUT_SECONDS")
     if timeout_override is not None:
         if timeout_override <= 0:
@@ -597,6 +607,8 @@ def main() -> int:
             openai_model=app_config.openai_model,
             openai_timeout_seconds=app_config.openai_timeout_seconds,
             openai_temperature=app_config.openai_temperature,
+            send_mode=app_config.imessage_send_mode,
+            image_path=app_config.imessage_default_image_path,
         )
         for result in send_results:
             if result.error:

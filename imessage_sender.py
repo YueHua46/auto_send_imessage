@@ -98,6 +98,10 @@ class IMessageSendPayload:
 
 APPLE_EPOCH_UNIX_SECONDS = 978307200
 
+# 图片批量发送时写入批次记录、以及送达回查用的占位（避免用空串触发 chat.db 匹配的歧义）
+IMESSAGE_IMAGE_RECORD_PREFIX = "__ime_image__:"
+IMESSAGE_IMAGE_DELIVERY_PROBE = "__iMessageAutoImageSend__"
+
 
 class IMessageLLMRewriter:
     """基于 OpenAI 兼容接口对 iMessage 文案做语义一致改写。"""
@@ -738,6 +742,8 @@ def send_imessages_with_risk_control(
     openai_model: str = "gemini-2.0-flash",
     openai_timeout_seconds: int = 20,
     openai_temperature: float = 0.9,
+    send_mode: Literal["text", "image"] = "image",
+    image_path: str | Path = "img/send_msg.png",
 ) -> list[SendResult]:
     # 采用传入的风控规则，否则用默认
     rules = rules or IMessageRiskControl()
@@ -785,16 +791,32 @@ def send_imessages_with_risk_control(
             temperature=openai_temperature,
         )
 
+    effective_rewriter = rewriter if send_mode == "text" else None
+
+    resolved_image_for_batch: Path | None = None
+    image_record_message: str | None = None
+    if send_mode == "image":
+        resolved_image_for_batch = Path(image_path).expanduser().resolve()
+        if not resolved_image_for_batch.exists():
+            raise IMessageSendError(f"图片文件不存在：{resolved_image_for_batch}")
+        suffix = resolved_image_for_batch.suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg"}:
+            raise IMessageSendError("send_mode=image 时仅支持 png / jpg / jpeg 图片。")
+        image_record_message = f"{IMESSAGE_IMAGE_RECORD_PREFIX}{resolved_image_for_batch}"
+
     # 排除正在冷却期手机号，及本批次已送达的手机号（同一消息文本）
     queued_phones = [phone for phone in unique_phones if phone not in cooling_down_phones]
     skip_statuses_in_batch = {"delivered", "sent_not_confirmed"}
+    batch_identity_message = (
+        image_record_message if send_mode == "image" and image_record_message else message
+    )
     already_processed_in_batch = {
         str(record.get("recipient", "")).strip()
         for record in batch_records_by_key.values()
         if str(record.get("delivery_status", "")) in skip_statuses_in_batch
         and (
-            rewriter is not None
-            or str(record.get("message", "")) == message
+            effective_rewriter is not None
+            or str(record.get("message", "")) == batch_identity_message
         )
     }
 
@@ -808,7 +830,7 @@ def send_imessages_with_risk_control(
                 {
                     "event_type": "skip_processed",
                     "recipient": phone,
-                    "message": message,
+                    "message": batch_identity_message,
                     "detail": detail,
                 },
             )
@@ -819,15 +841,18 @@ def send_imessages_with_risk_control(
     if dry_run:
         dry_run_results: list[SendResult] = []
         for phone in queued_phones[:send_budget]:
-            message_to_send = message
-            if rewriter is not None:
-                try:
-                    message_to_send = rewriter.rewrite(message)
-                except Exception:
-                    message_to_send = message
-            dry_run_results.append(
-                SendResult(phone=phone, status="dry_run", detail=f'将会发送 "{message_to_send}"')
-            )
+            if send_mode == "image":
+                assert resolved_image_for_batch is not None
+                detail = f"将会发送图片：{resolved_image_for_batch}"
+            else:
+                message_to_send = message
+                if effective_rewriter is not None:
+                    try:
+                        message_to_send = effective_rewriter.rewrite(message)
+                    except Exception:
+                        message_to_send = message
+                detail = f'将会发送文本："{message_to_send}"'
+            dry_run_results.append(SendResult(phone=phone, status="dry_run", detail=detail))
         return results + dry_run_results
 
     # 启动初期随机等待，进一步防止批量行为
@@ -846,9 +871,9 @@ def send_imessages_with_risk_control(
 
         attempted_at = _now_iso()
         message_to_send = message
-        if rewriter is not None:
+        if effective_rewriter is not None:
             try:
-                message_to_send = rewriter.rewrite(message)
+                message_to_send = effective_rewriter.rewrite(message)
             except Exception as rewrite_exc:
                 _append_batch_event(
                     batch_events_path,
@@ -860,12 +885,18 @@ def send_imessages_with_risk_control(
                     },
                 )
                 message_to_send = message
+        record_message = (
+            image_record_message if send_mode == "image" and image_record_message else message_to_send
+        )
+        delivery_message = (
+            IMESSAGE_IMAGE_DELIVERY_PROBE if send_mode == "image" else message_to_send
+        )
         _append_batch_event(
             batch_events_path,
             {
                 "event_type": "send_attempt",
                 "recipient": phone,
-                "message": message_to_send,
+                "message": record_message,
                 "attempted_at": attempted_at,
             },
         )
@@ -875,20 +906,24 @@ def send_imessages_with_risk_control(
             ensure_contact_exists(phone)
             time.sleep(1)  # 给通讯录同步留一点点时间
 
-            send_imessage_once(phone, message_to_send)
+            if send_mode == "image":
+                assert resolved_image_for_batch is not None
+                send_imessage_image_once(phone, resolved_image_for_batch)
+            else:
+                send_imessage_once(phone, message_to_send)
             sent_in_this_run += 1
             # 记录本次发送历史
             history.setdefault("messages", []).append(
                 {
                     "phone": phone,
                     "timestamp": str(time.time()),
-                    "message": message_to_send,
+                    "message": record_message,
                 }
             )
             _save_history(state_file, history)
             delivery_status = _poll_delivery_status(
                 phone,
-                message_to_send,
+                delivery_message,
                 timeout_seconds=delivery_check_timeout_seconds,
                 interval_seconds=delivery_check_interval_seconds,
                 lookback_seconds=delivery_check_lookback_seconds,
@@ -906,7 +941,7 @@ def send_imessages_with_risk_control(
                 {
                     "event_type": "delivery_status",
                     "recipient": phone,
-                    "message": message_to_send,
+                    "message": record_message,
                     "delivery_status": delivery_status.status,
                     "detail": delivery_status.detail,
                     "error": delivery_status.error,
@@ -915,7 +950,7 @@ def send_imessages_with_risk_control(
             _upsert_batch_record(
                 batch_records_by_key,
                 recipient=phone,
-                message=message_to_send,
+                message=record_message,
                 transport_status="sent",
                 delivery_status=delivery_status.status,
                 detail=delivery_status.detail,
@@ -943,14 +978,14 @@ def send_imessages_with_risk_control(
                 {
                     "event_type": "send_failed",
                     "recipient": phone,
-                    "message": message_to_send,
+                    "message": record_message,
                     "detail": error_detail,
                 },
             )
             _upsert_batch_record(
                 batch_records_by_key,
                 recipient=phone,
-                message=message_to_send,
+                message=record_message,
                 transport_status="failed",
                 delivery_status="failed",
                 detail=error_detail,
